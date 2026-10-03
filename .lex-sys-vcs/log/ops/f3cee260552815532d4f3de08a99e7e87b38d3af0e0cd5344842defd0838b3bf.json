@@ -1,0 +1,13 @@
+{
+  "op_id": "f3cee260552815532d4f3de08a99e7e87b38d3af0e0cd5344842defd0838b3bf",
+  "operation": {
+    "kind": "AddFunction",
+    "sig_id": "4f8967bd155fe19378bb3075cc72a067d717309fee8095e34980ef760e0493b1",
+    "stage_id": "1dccee1833b18eaddf4948ef562d08f562fa0ffd122c58ed6bc22d5a7406b2f6",
+    "effects": [
+      "file_read",
+      "file_write"
+    ],
+    "edition": 1
+  }
+}
