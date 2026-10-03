@@ -47,3 +47,13 @@ jobs:
       - name: The record format, from bytes
         working-directory: log
         run: ../lex-sys/target/release/lex-sys test tests/record_test.ls src/record.ls src/crc.ls --std
+
+      - name: Build logtool, the command line the crash sweep drives
+        working-directory: log
+        run: |
+          mkdir -p build
+          ../lex-sys/target/release/lex-sys build src/logtool.ls src/segment.ls src/record.ls src/crc.ls --std -o build/logtool
+
+      - name: The crash sweep (cuts, torn blocks, id order, a log longer than the window, sealed bit flips)
+        working-directory: log
+        run: python3 tests/sweep.py build/logtool
