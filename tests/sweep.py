@@ -55,6 +55,10 @@ def encode(ms, seq, pairs):
     return struct.pack("<I", len(body) + 4) + struct.pack("<I", crc32c(body)) + body
 
 
+def oracle_ids(data):
+    return parse(data)[0]
+
+
 def parse(data):
     """The longest valid prefix of `data`: ([(ms, seq, end_offset)], valid_end, verdict) with verdict 0 clean, 1 torn,
     2 damaged, exactly as logtool reports them."""
@@ -118,6 +122,17 @@ def write_log(directory, count, sync_every, seed):
         elif w[0] == "sync":
             syncs.append(int(w[1]))
     return ends, syncs
+
+
+def dump(directory):
+    """Records as `log.read_at` reads them back: [(ms, seq, size)]."""
+    out = run("dump", directory)
+    rows = []
+    for line in out.stdout.splitlines():
+        w = line.split()
+        if w and w[0] == "r":
+            rows.append((int(w[1]), int(w[2]), int(w[3])))
+    return out.returncode, rows
 
 
 def recover(directory, mode):
@@ -221,6 +236,109 @@ def main():
                 donor = donor.ljust(hi - lo, b"\xa5")
                 swapped = image[:lo] + donor + image[hi:]
                 check_active(sb, swapped, acked_end, f"swapped {lo}:{hi}")
+
+        # ---- 2b. recovery, then appending: the file is a valid prefix followed by the new records ------------------
+        # A crash and a restart are recover-then-write. For a sample of the crash states, run that, and require the result
+        # to be one clean log: the valid prefix, then three new records whose ids come after it, every acknowledged one
+        # still there.
+        for k in list(range(acked_end, n + 1, 7)) + [n]:
+            cut = image[:k]
+            want, want_end, _ = parse(cut)
+            d = sb.image(cut)
+            out = run("write", d, "3", "1", "5")
+            check(out.returncode == 0, f"restart at {k}: write exited {out.returncode}")
+            final = open(os.path.join(d, SEG), "rb").read()
+            records, end, verdict = parse(final)
+            check(verdict == 0 and end == len(final), f"restart at {k}: the log is not clean afterwards")
+            check(len(records) == len(want) + 3, f"restart at {k}: {len(records)} records, wanted {len(want) + 3}")
+            check(final[:want_end] == cut[:want_end], f"restart at {k}: the old valid prefix changed")
+            kept = sum(1 for _, _, e in records if e <= acked_end)
+            check(kept == len(ACKED_ENDS), f"restart at {k}: an acknowledged record was lost")
+
+        # ---- 2c. what the log reads back is what is on disk, and flushes are the calls the tool says -----------------
+        code, rows = dump(sb.image(image))
+        check(code == 0 and [(m, q) for m, q, _ in rows] == [(m, q) for m, q, _ in oracle_ids(image)],
+              "dump reads back every record, in order")
+        check(sum(t for _, _, t in rows) == n, "dump's sizes add up to the file")
+        # A torn file reads back only its valid prefix.
+        code, rows = dump(sb.image(image[: acked_end + 5]))
+        want, _, _ = parse(image[: acked_end + 5])
+        check(code == 0 and len(rows) == len(want), "dump of a torn file reads only the valid prefix")
+        if shutil.which("strace"):
+            d = os.path.join(sb.root, "flushes")
+            os.makedirs(d)
+            trace = os.path.join(sb.root, "flush-trace.txt")
+            out = subprocess.run(["strace", "-f", "-e", "trace=fsync", "-o", trace, TOOL, "write", d, "30", "4", "1"],
+                                 capture_output=True, text=True)
+            said = sum(1 for l in out.stdout.splitlines() if l.startswith("sync "))
+            saw = sum(1 for l in open(trace).read().splitlines() if "fsync(" in l and l.endswith("= 0"))
+            check(said == saw and said == 7, f"one fsync for each flush the tool reports ({saw} fsyncs, {said} reported)")
+            peeks = [l.split() for l in out.stdout.splitlines() if l.startswith("peek_")]
+            check(all(w[1] == "1" for w in peeks if w[0] == "peek_unflushed"),
+                  "a record is not readable before a flush has covered it")
+            check(all(w[1] == "0" for w in peeks if w[0] == "peek_flushed") and sum(1 for w in peeks if w[0] == "peek_flushed") == 7,
+                  "and is readable once the flush has")
+            # A second flush with nothing new does not call fsync again: 777 asks the tool to flush twice each time.
+            d2 = os.path.join(sb.root, "twice")
+            os.makedirs(d2)
+            trace2 = os.path.join(sb.root, "twice-trace.txt")
+            subprocess.run(["strace", "-f", "-e", "trace=fsync", "-o", trace2, TOOL, "write", d2, "5", "777", "1"],
+                           capture_output=True, text=True)
+            check(sum(1 for l in open(trace2).read().splitlines() if "fsync(" in l) == 5,
+                  "a flush with nothing new does not call fsync again (5 records, 10 flushes, 5 fsyncs)")
+            # `flush` with nothing new does not call fsync: a count of 0 flushes means 0 fsyncs.
+            d0 = os.path.join(sb.root, "noflush")
+            os.makedirs(d0)
+            trace0 = os.path.join(sb.root, "noflush-trace.txt")
+            subprocess.run(["strace", "-f", "-e", "trace=fsync", "-o", trace0, TOOL, "write", d0, "10", "0", "1"],
+                           capture_output=True, text=True)
+            check(sum(1 for l in open(trace0).read().splitlines() if "fsync(" in l) == 0,
+                  "appending without flushing makes no fsync call")
+
+        # ---- 2d. what append and flush refuse, and what a failing file does to them ----------------------------------
+        def misuse(kind):
+            d = os.path.join(sb.root, "misuse-" + kind)
+            os.makedirs(d)
+            if kind == "full":
+                os.symlink("/dev/full", os.path.join(d, SEG))   # a write fails with ENOSPC
+            elif kind == "null":
+                os.symlink("/dev/null", os.path.join(d, SEG))   # writes succeed, fsync fails with EINVAL
+            out = run("misuse", d)
+            return dict((l.split()[0], int(l.split()[1])) for l in out.stdout.splitlines() if len(l.split()) == 2)
+
+        normal = misuse("normal")
+        check(normal == {"first": 0, "repeat_id": 1, "lower_id": 1, "same_ms_lower_seq": 1, "too_long": 2, "next": 0,
+                         "flush": 0, "broken": 0, "append_after": 0, "flush_after": 0},
+              f"append refuses a repeated or lower id (1) and an over-long record (2), accepts the next id: {normal}")
+        full = misuse("full")
+        check(full == {"first": 28, "repeat_id": 3, "lower_id": 3, "same_ms_lower_seq": 3, "too_long": 3, "next": 3,
+                       "flush": 3, "broken": 1, "append_after": 3, "flush_after": 3},
+              f"a failed write answers its errno (ENOSPC, 28), and the log refuses everything after it: {full}")
+        null = misuse("null")
+        check(null["first"] == 0 and null["next"] == 0 and null["flush"] == 22 and null["broken"] == 1
+              and null["append_after"] == 3 and null["flush_after"] == 3,
+              f"a failed flush answers its errno (EINVAL, 22), and the log refuses everything after it: {null}")
+
+        # ---- 2e. the log's own bookkeeping: its record count and last id, from a write, and across a restart ---------
+        d = os.path.join(sb.root, "state")
+        os.makedirs(d)
+        out = run("write", d, "7", "3", "5")
+        state = [l.split() for l in out.stdout.splitlines() if l.startswith("state")]
+        check(state == [["state", "7", "7", "0"]], f"after 7 appends: 7 records, last id 7-0 ({state})")
+        out = run("write", d, "4", "2", "6")
+        state = [l.split() for l in out.stdout.splitlines() if l.startswith("state")]
+        check(state == [["state", "11", "11", "0"]], f"after a restart and 4 more: 11 records, last id 11-0 ({state})")
+        check("stale 1" in out.stdout.splitlines(), "after a restart, an append at the old last id is refused")
+
+        # ---- 2f. recovery flushes only when it cut something ---------------------------------------------------------
+        if shutil.which("strace"):
+            for label, data, want_fsyncs in (("a clean file", image, 0), ("a torn file", image[: acked_end + 3], 1)):
+                d = sb.image(data)
+                trace = os.path.join(sb.root, "recover-trace.txt")
+                subprocess.run(["strace", "-f", "-e", "trace=fsync", "-o", trace, TOOL, "write", d, "0", "0", "1"],
+                               capture_output=True, text=True)
+                got = sum(1 for l in open(trace).read().splitlines() if "fsync(" in l and l.endswith("= 0"))
+                check(got == want_fsyncs, f"recovery of {label} makes {want_fsyncs} fsync(s), made {got}")
 
         # ---- 3b. records that are well formed and checksummed but whose ids do not increase ----------------------
         # A record can only know it is whole; whether it belongs is the segment's question. Each file here is valid byte

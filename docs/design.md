@@ -244,3 +244,18 @@ An OpenTelemetry front-end, if it is wanted, is an adapter in front of L4's trai
 * **Argument slices live only inside their `borrow`.** The tool copies the command line into a region before using it.
 
 **What is still not covered.** Rolling a segment and replacing the manifest (section 6.3's table); the append path with a group flush; a log of more than one segment, where the id a segment must exceed comes from the one before; and everything the sweep cannot show (section 6.4).
+
+### 12.1 The append path
+
+`src/log.ls` is a stream's segment open for appending and reading: `recover` (cut a torn tail and flush the cut), `attach` (take over the recovered file with three handles opened by the caller, so the caller's `Fs` decides what path it reaches and this module needs no capability), `append`, `flush`, and `read_at`. `append` and `flush` are separate steps so that one flush can cover many appends (design section 5). `read_at` sees only what a flush has covered, so a record is never readable before it could survive a crash. A failed write or a failed flush **breaks** the log: it refuses everything after, and is not retried (section 5).
+
+`logtool write` now goes through this API: it recovers whatever is there, then appends. A crash and a restart are therefore the same two steps the sweep already ran, and the sweep checks the composition: for a sample of crash states, recover-then-append leaves one clean log that is the old valid prefix followed by the new records, with every acknowledged record still there.
+
+**What was added to the sweep for it (now 8,883 checks):** records read back through `read_at` equal the file, in order, and a torn file reads back only its valid prefix; a record is not readable until a flush has covered it, and is after; one `fsync` per flush the tool reports, none for appends alone, none for a second flush with nothing new; recovery makes one `fsync` when it cut something and none when it did not; `append` refuses a repeated id, a lower id, the same ms with a lower seq, and a record longer than the maximum, and accepts the next id; the log's record count and last id are right after a write and across a restart, and after a restart an append at the old last id is refused; and **two failing files**: `/dev/full` (a write fails with `ENOSPC`, which the log reports and then refuses everything) and `/dev/null` (writes succeed, `fsync` fails with `EINVAL`, which the log reports and then refuses everything).
+
+**Mutation testing, in a scratch copy and never committed:** 17 mutants of `log.ls`; 15 are killed. The first run left five survivors; three were gaps in the sweep and each got a check (id order, the record count and last id, and a failed flush not breaking the log). **Two survive and are not observable at the process level, and are recorded as such:**
+
+* **The loop that resumes a partial `write`.** A `write` to a regular file is whole unless the disk fills or a signal interrupts it, and neither can be caused here without a signal handler or a device that writes short. The branch is exercised only on its first pass. It is simple and is read, not tested.
+* **`read_at`'s checksum check on a durable record.** In a log this module wrote it always passes, and the tool's recovery truncates a damaged file before `read_at` is reached, so the `bad` answer is unreachable from the tool. It is defence against bit rot in a record that was whole when it was flushed; the sweep's sealed-segment bit flips cover the same ground through `recover`.
+
+**What is still not built:** rolling to a second segment and the manifest (section 6.3), the Redis Streams commands, consumer groups. None is needed for the first version of `lexsys-hooks`, which uses one segment.

@@ -5,13 +5,15 @@ import std.buffer;
 import crc;
 import record;
 import segment;
+import log;
 
 // `logtool` -- the two operations the crash sweep (`tests/sweep.py`, `docs/design.md` section 6.2) needs from the real
 // code, as a command line:
 //
-//     logtool write   <dir> <count> <sync_every> <seed>    write <dir>/0.seg, one record at a time, syncing every
-//                                                           `sync_every` records, and print every record's end and
-//                                                           every sync, so the sweep knows what was acknowledged
+//     logtool write   <dir> <count> <sync_every> <seed>    recover <dir>/0.seg, then append <count> records to it, flushing every
+//                                                           `sync_every`, printing every record's end and every flush,
+//                                                           so the sweep knows what was acknowledged
+//     logtool dump    <dir>                                 print every durable record, read back through the log
 //     logtool recover <dir> active|sealed                   scan <dir>/0.seg; an active segment is cut to its last whole
 //                                                           record, a sealed one that is not whole is refused (exit 3)
 //
@@ -71,60 +73,235 @@ fn say[&i, &r](io: &!i Io, word: &r [byte], value: int) -> [io_write] int {
     return 0;
 }
 
-fn cmd_write[&c, &i, &r](fs: &c Fs(""), io: &!i Io, dir: &r [byte], count: int, sync_every: int, seed: int) -> [fs_write(""), file_write, io_write] int {
+fn cmd_write[&c, &i, &r, &w](fs: &c Fs(""), io: &!i Io, dir: &r [byte], count: int, sync_every: int, seed: int, window: &!w [byte]) -> [fs_read(""), fs_write(""), file_read, file_write, io_write] int {
     var status = 0;
     region a {
         let path_buf = alloc_slice[a](4096, byte_of(0));
         let path = path_buf[0..seg_path(path_buf, dir)];
         let out = alloc_slice[a](512, byte_of(0));
         let value = alloc_slice[a](64, byte_of(0));
-        match open_write(fs, path) {
+        // Three handles to one file: an append handle (which creates it), a read-write handle for recovery, a read handle.
+        match open_append(fs, path) {
             Opened::Failed(e) => {
                 status = 100 + e;
             }
-            Opened::Ok(opened) => {
-                var file = opened;
-                borrow mut file as &!h in {
-                    var offset = 0;
-                    var state = seed;
-                    var i = 0;
-                    while i < count && status == 0 {
-                        // A value of 0 to 39 bytes, from a generator that cannot overflow.
-                        state = (state * 7919 + 12345) % 2147483648;
-                        let vlen = state / 65536 % 40;
-                        var k = 0;
-                        while k < vlen {
-                            state = (state * 7919 + 12345) % 2147483648;
-                            value[k] = byte_of(state / 65536 % 256);
-                            k = k + 1;
+            Opened::Ok(w) => {
+                match open_rw(fs, path) {
+                    Opened::Failed(e) => {
+                        status = 100 + e;
+                        file_close(w);
+                    }
+                    Opened::Ok(rw0) => {
+                        var rw = rw0;
+                        var rec = (0, 0, 0, 0 - 1, 0 - 1);
+                        borrow mut rw as &!x in {
+                            rec = log.recover(x, window, max_len());
                         }
-                        var p = record.begin(out, 0, i + 1, 0, 2);
-                        p = record.put_pair(out, p, "n", value[0..vlen]);
-                        p = record.put_pair(out, p, "", "x");
-                        let total = record.seal(out, 0, p);
-                        status = write_fully(h, out[0..total]);
-                        offset = offset + total;
-                        say(io, "rec", i);
-                        io.space(io);
-                        io.print_int(io, offset);
-                        io.newline(io);
-                        i = i + 1;
-                        if sync_every > 0 && i % sync_every == 0 {
-                            match file_sync(h) {
-                                Done::Ok(n) => {
-                                    say(io, "sync", offset);
-                                    io.newline(io);
+                        file_close(rw);
+                        if rec.0 != 0 {
+                            status = 140;
+                            file_close(w);
+                        } else {
+                            match open_read(fs, path) {
+                                Opened::Failed(e) => {
+                                    status = 100 + e;
+                                    file_close(w);
                                 }
-                                Done::Failed(e) => {
-                                    status = 200 + e;
+                                Opened::Ok(rd) => {
+                                    var lg = log.attach(w, rd, rec.1, rec.2, rec.3, rec.4, max_len());
+                                    var first = rec.3;
+                                    if first < 0 {
+                                        first = 0;
+                                    }
+                                    borrow mut lg as &!l in {
+                                        // After a restart, the last id of the old log still binds: an append at it must be refused.
+                                        if rec.2 > 0 {
+                                            var q = record.begin(out, 0, rec.3, rec.4, 0);
+                                            let qtotal = record.seal(out, 0, q);
+                                            say(io, "stale", log.append(l, out[0..qtotal], rec.3, rec.4));
+                                            io.newline(io);
+                                        }
+                                        var state = seed;
+                                        var i = 0;
+                                        while i < count && status == 0 {
+                                            // A value of 0 to 39 bytes, from a generator that cannot overflow.
+                                            state = (state * 7919 + 12345) % 2147483648;
+                                            let vlen = state / 65536 % 40;
+                                            var k = 0;
+                                            while k < vlen {
+                                                state = (state * 7919 + 12345) % 2147483648;
+                                                value[k] = byte_of(state / 65536 % 256);
+                                                k = k + 1;
+                                            }
+                                            let ms = first + 1 + i;
+                                            var p = record.begin(out, 0, ms, 0, 2);
+                                            p = record.put_pair(out, p, "n", value[0..vlen]);
+                                            p = record.put_pair(out, p, "", "x");
+                                            let total = record.seal(out, 0, p);
+                                            let start = log.size(l);
+                                            status = log.append(l, out[0..total], ms, 0);
+                                            say(io, "rec", i);
+                                            io.space(io);
+                                            io.print_int(io, log.size(l));
+                                            io.newline(io);
+                                            // A record is not readable until a flush has covered it.
+                                            let before = log.read_at(l, start, window);
+                                            say(io, "peek_unflushed", before.0);
+                                            io.newline(io);
+                                            i = i + 1;
+                                            if status == 0 && sync_every > 0 && (i % sync_every == 0 || sync_every == 777) {
+                                                status = log.flush(l);
+                                                // A flush with nothing new must do nothing; 777 asks for a redundant one after each.
+                                                if sync_every == 777 && status == 0 {
+                                                    status = log.flush(l);
+                                                }
+                                                if status == 0 {
+                                                    say(io, "sync", log.synced(l));
+                                                    io.newline(io);
+                                                    let after = log.read_at(l, start, window);
+                                                    say(io, "peek_flushed", after.0);
+                                                    io.newline(io);
+                                                }
+                                            }
+                                        }
+                                        say(io, "end", log.size(l));
+                                        io.newline(io);
+                                        say(io, "state", log.records(l));
+                                        io.space(io);
+                                        io.print_int(io, log.last_ms(l));
+                                        io.space(io);
+                                        io.print_int(io, log.last_seq(l));
+                                        io.newline(io);
+                                    }
+                                    log.close(lg);
                                 }
                             }
                         }
                     }
-                    say(io, "end", offset);
-                    io.newline(io);
                 }
-                file_close(file);
+            }
+        }
+    }
+    return status;
+}
+
+// What `append` and `flush` answer to calls they must refuse, and after a failure: `logtool misuse <dir>` on a file that
+// is a normal file, `logtool misuse <dir>` where <dir>/0.seg is /dev/full (a write fails with ENOSPC) or /dev/null (writes
+// succeed and `fsync` fails with EINVAL). Prints one `name code` line for each call.
+fn cmd_misuse[&c, &i, &r, &w](fs: &c Fs(""), io: &!i Io, dir: &r [byte], window: &!w [byte]) -> [fs_read(""), fs_write(""), file_write, io_write] int {
+    var status = 0;
+    region a {
+        let path_buf = alloc_slice[a](4096, byte_of(0));
+        let path = path_buf[0..seg_path(path_buf, dir)];
+        let out = alloc_slice[a](512, byte_of(0));
+        match open_append(fs, path) {
+            Opened::Failed(e) => {
+                status = 100 + e;
+            }
+            Opened::Ok(w) => {
+                match open_read(fs, path) {
+                    Opened::Failed(e) => {
+                        status = 100 + e;
+                        file_close(w);
+                    }
+                    Opened::Ok(rd) => {
+                        var lg = log.attach(w, rd, 0, 0, 0 - 1, 0 - 1, max_len());
+                        borrow mut lg as &!l in {
+                            var p = record.begin(out, 0, 5, 0, 0);
+                            let total = record.seal(out, 0, p);
+                            say(io, "first", log.append(l, out[0..total], 5, 0));
+                            io.newline(io);
+                            say(io, "repeat_id", log.append(l, out[0..total], 5, 0));
+                            io.newline(io);
+                            say(io, "lower_id", log.append(l, out[0..total], 3, 9));
+                            io.newline(io);
+                            say(io, "same_ms_lower_seq", log.append(l, out[0..total], 5, 0 - 1));
+                            io.newline(io);
+                            // Longer than max_len: refused before anything is written.
+                            say(io, "too_long", log.append(l, window[0..max_len() + 100], 6, 0));
+                            io.newline(io);
+                            say(io, "next", log.append(l, out[0..total], 6, 0));
+                            io.newline(io);
+                            say(io, "flush", log.flush(l));
+                            io.newline(io);
+                            var flag = 0;
+                            if log.broken(l) {
+                                flag = 1;
+                            }
+                            say(io, "broken", flag);
+                            io.newline(io);
+                            say(io, "append_after", log.append(l, out[0..total], 7, 0));
+                            io.newline(io);
+                            say(io, "flush_after", log.flush(l));
+                            io.newline(io);
+                        }
+                        log.close(lg);
+                    }
+                }
+            }
+        }
+    }
+    return status;
+}
+
+// Print every durable record of <dir>/0.seg as `<ms> <seq> <total_size>`, read back through `log.read_at`.
+fn cmd_dump[&c, &i, &r, &w](fs: &c Fs(""), io: &!i Io, dir: &r [byte], window: &!w [byte]) -> [fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    var status = 0;
+    region a {
+        let path_buf = alloc_slice[a](4096, byte_of(0));
+        let path = path_buf[0..seg_path(path_buf, dir)];
+        match open_append(fs, path) {
+            Opened::Failed(e) => {
+                status = 100 + e;
+            }
+            Opened::Ok(w) => {
+                match open_rw(fs, path) {
+                    Opened::Failed(e) => {
+                        status = 100 + e;
+                        file_close(w);
+                    }
+                    Opened::Ok(rw0) => {
+                        var rw = rw0;
+                        var rec = (0, 0, 0, 0 - 1, 0 - 1);
+                        borrow mut rw as &!x in {
+                            rec = log.recover(x, window, max_len());
+                        }
+                        file_close(rw);
+                        match open_read(fs, path) {
+                            Opened::Failed(e) => {
+                                status = 100 + e;
+                                file_close(w);
+                            }
+                            Opened::Ok(rd) => {
+                                var lg = log.attach(w, rd, rec.1, rec.2, rec.3, rec.4, max_len());
+                                borrow mut lg as &!l in {
+                                    var at = 0;
+                                    var going = true;
+                                    while going {
+                                        let r = log.read_at(l, at, window);
+                                        if r.0 == 0 {
+                                            say(io, "r", record.ms_of(window, 0));
+                                            io.space(io);
+                                            io.print_int(io, record.seq_of(window, 0));
+                                            io.space(io);
+                                            io.print_int(io, r.1);
+                                            io.newline(io);
+                                            at = at + r.1;
+                                        } else {
+                                            going = false;
+                                            if r.0 != 1 {
+                                                status = 150;
+                                            }
+                                        }
+                                    }
+                                    say(io, "end", at);
+                                    io.newline(io);
+                                }
+                                log.close(lg);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -234,7 +411,17 @@ fn main(world: World) -> [] int {
                 borrow fs as &c in {
                     borrow mut out as &!o in {
                         if lens[1] == 5 && count >= 6 {
-                            status = cmd_write(c, o, dir, parse(words[starts[3]..starts[3] + lens[3]]), parse(words[starts[4]..starts[4] + lens[4]]), parse(words[starts[5]..starts[5] + lens[5]]));
+                            borrow mut wbuf as &!wb in {
+                                status = cmd_write(c, o, dir, parse(words[starts[3]..starts[3] + lens[3]]), parse(words[starts[4]..starts[4] + lens[4]]), parse(words[starts[5]..starts[5] + lens[5]]), buffer.room(wb));
+                            }
+                        } else if lens[1] == 6 && count >= 3 {
+                            borrow mut wbuf as &!wb in {
+                                status = cmd_misuse(c, o, dir, buffer.room(wb));
+                            }
+                        } else if lens[1] == 4 && count >= 3 {
+                            borrow mut wbuf as &!wb in {
+                                status = cmd_dump(c, o, dir, buffer.room(wb));
+                            }
                         } else if lens[1] == 7 && count >= 4 {
                             let sealed = int_of(words[starts[3]]) == 115;
                             borrow mut wbuf as &!wb in {
