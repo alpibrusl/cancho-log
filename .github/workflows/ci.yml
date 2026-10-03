@@ -7,8 +7,9 @@ on:
 
 env:
   # The compiler these sources are built and tested with: part of the contract, since a source file does not record which
-  # `std` it was written against. This is lex-sys's main after the file-write primitives (#188, #189) were merged.
-  LEX_SYS_REV: 3d46717a124e833866480b2bd7966e513509f281
+  # `std` it was written against. This is lex-sys's main after packages across repositories (#192) were merged, which
+  # `vcs publish --dir` (the committed stores below) needs.
+  LEX_SYS_REV: f804ce7e6fcf5717ea52442bf648a1fe81090f98
 
 jobs:
   test:
@@ -57,3 +58,11 @@ jobs:
       - name: The crash sweep (cuts, torn blocks, id order, a log longer than the window, sealed bit flips)
         working-directory: log
         run: python3 tests/sweep.py build/logtool
+
+      - name: The committed stores are what the source publishes
+        working-directory: log
+        run: |
+          ../lex-sys/target/release/lex-sys vcs publish --dir src --store .lex-sys-vcs
+          git diff --exit-code -- .lex-sys-vcs
+          test -z "$(git status --porcelain -- .lex-sys-vcs)"
+          for m in crc record segment log; do ../lex-sys/target/release/lex-sys vcs resolve .lex-sys-vcs/$m; done

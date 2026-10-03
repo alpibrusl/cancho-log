@@ -79,6 +79,24 @@ Several appends can share one `flush` (group commit); that is the whole reason t
 it is reopened and recovered, because the file's contents are then unknown. A caller that gets a nonzero code answers its
 clients with an error, never an acknowledgement.
 
+## Using it from another program
+
+The four modules are published as [lex-sys](https://github.com/alpibrusl/lex-sys) packages in `.lex-sys-vcs/` (one store per
+module, `log` requiring the rest), so a program pins this repository by commit instead of cloning it next to its own:
+
+```sh
+LOG=<a full commit hash of lexsys-log>
+lex-sys vcs lock --git https://github.com/alpibrusl/lexsys-log --rev $LOG --path .lex-sys-vcs/log -o deps/log.lock --all
+lex-sys vcs fetch --lock deps/log.lock -o build/deps          # re-checks every pin; writes build/deps/<hash>.ls
+lex-sys build src/main.ls build/deps/*.ls --std -o build/app  # `import log;` and `import record;` resolve against them
+```
+
+The lock holds the commit hash and the hash of each source, never a branch name; the fetched sources are re-parsed,
+re-typechecked and re-hashed, so what git delivers is checked rather than trusted
+([`lex-sys` `docs/package-system.md`](https://github.com/alpibrusl/lex-sys/blob/main/docs/package-system.md) section 7). CI
+checks that the committed stores are exactly what `lex-sys vcs publish --dir src --store .lex-sys-vcs` makes of the source;
+after changing a module, run that command and commit the result.
+
 ## The record
 
 ```
@@ -116,6 +134,7 @@ src/record.ls    the record: build, seal, check, read fields
 src/segment.ls   scan a segment and decide what survives
 src/log.ls       the open log: append, flush, read_at
 src/logtool.ls   the command line the sweep drives
+.lex-sys-vcs/    the modules as lex-sys packages, for locking this repository from another program
 tests/           unit tests (lex-sys) and the crash sweep (Python)
 bench/           the checksum's speed
 docs/design.md   the plan
