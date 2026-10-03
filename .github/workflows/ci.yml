@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  # The compiler these sources are built and tested with: part of the contract, since a source file does not record which
+  # `std` it was written against. This is lex-sys's main after the file-write primitives (#188, #189) were merged.
+  LEX_SYS_REV: 3d46717a124e833866480b2bd7966e513509f281
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: log
+
+      - uses: actions/checkout@v4
+        with:
+          repository: alpibrusl/lex-sys
+          ref: ${{ env.LEX_SYS_REV }}
+          path: lex-sys
+
+      - name: Cache the compiler
+        id: compiler
+        uses: actions/cache@v4
+        with:
+          path: lex-sys/target/release/lex-sys
+          key: lex-sys-${{ env.LEX_SYS_REV }}
+
+      - name: Build lex-sys
+        if: steps.compiler.outputs.cache-hit != 'true'
+        working-directory: lex-sys
+        run: cargo build --release -p lex-sys
+
+      - name: Formatting
+        working-directory: log
+        run: ../lex-sys/target/release/lex-sys fmt --check src tests bench
+
+      - name: CRC-32C against the RFC 3720 vectors
+        working-directory: log
+        run: ../lex-sys/target/release/lex-sys test tests/crc_test.ls src/crc.ls --std
+
+      - name: The record format, from bytes
+        working-directory: log
+        run: ../lex-sys/target/release/lex-sys test tests/record_test.ls src/record.ls src/crc.ls --std
