@@ -214,7 +214,7 @@ About 200 ns for a 100-byte record, and about 410-490 MB/s. The answer to the qu
 
 | step | builds | needs from lex-sys |
 |---|---|---|
-| **L0** | the record format and CRC-32C (**built**: `src/crc.ls`, `src/record.ls`, tests and mutation checked), then the segment and manifest code, recovery, and the byte-by-byte sweep (section 6). No network. | `file-writes.md` slices 1 and 2: **built** |
+| **L0** | the record format and CRC-32C (**built**), the segment scan and recovery with the crash sweep (**built**, section 12), then the manifest, rolling a segment, appending with a group flush, and the directory-level crash points (section 6.3). No network. | `file-writes.md` slices 1 and 2: **built** |
 | **L1** | the RESP loop (copied from `lexsys-cache` with attribution, to be extracted as a package once two projects use it), `XADD`, `XLEN`, `XRANGE`, `XREAD`, the handshake, the differential harness | nothing new |
 | **L2** | consumer groups: the group log, snapshotting by rename, `XREADGROUP`, `XACK`, `XPENDING`, `XCLAIM` | nothing new |
 | **L3** | trimming, `XDEL` tombstones, the `interval` policy, the measurements of section 10 | `fdatasync` if the gate's caveat bites |
@@ -228,3 +228,19 @@ An OpenTelemetry front-end, if it is wanted, is an adapter in front of L4's trai
 2. **Is `interval` worth shipping in v1,** given that it is the one policy where an acknowledged append can be lost? It is what makes Redis fast by default and what makes it surprising, and the INFO line is the only guard.
 3. **Where does the RESP parser live?** Copying it from `lexsys-cache` is the quick answer and means two copies of a parser; extracting a package is the right one and is a lex-sys `vcs publish` exercise of its own.
 4. **Does exact `XTRIM` matter?** Section 7 refuses it. Redis users mostly use `~`, but a client that sends the exact form gets an error, not a trim.
+
+## 12. What building recovery showed
+
+`src/segment.ls` scans a segment and cuts or refuses it; `src/logtool.ls` is a command line over it; `tests/sweep.py` is the sweep of section 6.2 with an independent reader of the format written in Python (its own CRC-32C, its own structure checks).
+
+**What the sweep covers.** On a real 24-record, 1,574-byte log whose last flush was at byte 1,301: a cut at **every byte from the last flush to the end**; a 64-byte and a 512-byte block of the unflushed region zeroed, and replaced by bytes from elsewhere in the file; well-formed, checksummed records whose ids repeat or go backwards (recovery must stop there); a 3,500-record log of about 170 KB, longer than the 68 KiB scan window, clean and cut at every record boundary near each window step; the cut file's `ftruncate` followed by one successful `fsync` (read from `strace`); and **a bit flipped at every byte, bits 0 and 7, in a sealed segment, each of which must be refused** and leave the file untouched. 8,662 checks, 0 failures, about 9 seconds. In each, recovery's answer is compared with the independent reader's, every acknowledged record must be in the valid prefix, the file after recovery must be exactly that prefix, and a second recovery must change nothing.
+
+**Mutation testing, in a scratch copy and never committed.** 15 mutants of the scan and the tool, all killed: a scan that keeps a damaged record, reports `valid_end` one record early, reports the torn tail at the end of the file, lets ids repeat or go backwards, never refills the window, counts records wrongly or calls a clean file torn; a tool that never refuses a sealed segment, never truncates, truncates a byte too far, forgets to flush the truncation, or misreads the mode; and a record reader that never compares the checksum. **The first run left three survivors, and each was a real gap in the sweep:** no file had ids that parse but go backwards, no file was longer than the scan window (so the refill path was never taken), and nothing observed whether the truncation was flushed (a process-level test cannot see a missing flush, only the call can, so the sweep reads `strace`). Each got a check and the mutants now die.
+
+**Findings about lex-sys.**
+
+* **A region's arena is 64 KiB, and an allocation past it traps.** The first `logtool recover` died with an illegal instruction on a 65,536-byte window allocated in a region. A buffer of a record's maximum size has to be a heap box (`std.buffer`), which is what the tool now does. A log whose maximum record is 1 MiB, as the design says, is therefore a heap buffer by construction. This is a fact about the language, not a bug, and it is now stated here because it is the kind of thing a design written without building would not have said.
+* **`narrow` takes its prefix as a literal**, so a tool whose directory comes from the command line holds the unnarrowed `Fs("")`. That is acceptable for a test tool and is the first appearance of the problem `docs/design.md` of `lexsys-hooks` predicts (section 7 there): a *server*'s data directory, chosen at run time, cannot be named in its type.
+* **Argument slices live only inside their `borrow`.** The tool copies the command line into a region before using it.
+
+**What is still not covered.** Rolling a segment and replacing the manifest (section 6.3's table); the append path with a group flush; a log of more than one segment, where the id a segment must exceed comes from the one before; and everything the sweep cannot show (section 6.4).
