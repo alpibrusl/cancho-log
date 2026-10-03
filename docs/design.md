@@ -64,12 +64,14 @@ A record is a header and a body, little-endian, no padding:
 
 | bytes | field | |
 |---|---|---|
-| 4 | `len` | bytes that follow this field; at least 28; at most the configured maximum (default 1 MiB), above which an append is refused |
+| 4 | `len` | bytes that follow this field: at least 24 (a record with no pairs is 28 bytes in all), at most the configured maximum (default 1 MiB), above which an append is refused |
 | 4 | `crc` | CRC-32C of everything after this field |
-| 8 | `ms` | the entry id's millisecond part |
-| 8 | `seq` | its sequence part |
+| 8 | `ms` | the entry id's millisecond part, 0 to 2^63 - 1 |
+| 8 | `seq` | its sequence part, the same range |
 | 4 | `fields` | the number of field/value pairs |
 | ... | pairs | each pair is `u32` length, bytes, `u32` length, bytes |
+
+Ids are held in lex-sys's signed 64-bit `int`, so an id at or above 2^63 is refused, on write and on read. Redis's ids are unsigned; a millisecond clock is nowhere near 2^63, and an explicit `XADD` id above it is an error that says so, a departure listed in the README. The record layout above is implemented in `src/record.ls` and the CRC in `src/crc.ls`.
 
 **What the checksum is for.** A torn write leaves a record whose length says it extends past the end of the file, or whose bytes are not what the checksum says. CRC-32C is the choice because it is cheap, is what other logs use for this exact job, and catches the failures that matter (a prefix of the record, a page of zeros, a page from an older file). It is not a defence against an adversary: whoever can write the file can write a matching checksum. Tamper-evidence is a separate layer (section 8).
 
@@ -190,17 +192,29 @@ If either cell misses, the result says which and by how much, and the README doe
 
 | not measured | decides |
 |---|---|
-| CRC-32C throughput in lex-sys (a 256-entry table, checked arithmetic) | whether the checksum is a visible fraction of an append, and whether a slicing-by-8 table is needed |
+| ~~CRC-32C throughput in lex-sys~~ **measured, section 10.1** | |
 | recovery time per gigabyte of active-plus-sealed log | whether startup scans every segment or trusts sealed-segment sidecars, and what "start in seconds" costs |
 | the cost of building the id index on open (trail mode) | whether the index is persisted or rebuilt, and at what log size that flips |
 | a flush on its own thread against on the loop | whether the loop's flush stall is worth a second thread |
 | memory per stream, per group, per pending entry | the real limit on how many streams and groups a process can hold |
 
+### 10.1 CRC-32C, measured
+
+A table-driven CRC-32C in lex-sys (`src/crc.ls`, a 256-entry table computed at compile time, checked arithmetic, `--backend llvm`), over a buffer of `size` bytes repeated, one core of this machine, `bench/crc_speed.ls`:
+
+| record size | rounds | ns per record | MB/s |
+|---|---|---|---|
+| 100 B | 2,000,000 (three runs) | 218 / 206 / 204 | 459 / 484 / 490 |
+| 1,000 B | 200,000 | 2,446 | 409 |
+| 4,096 B | 50,000 | 10,181 | 402 |
+
+About 200 ns for a 100-byte record, and about 410-490 MB/s. The answer to the question this row asked: **the checksum is not a visible part of an append.** Against a flush of about 200,000 ns it is 0.1%; with the flush out of the way (`interval` or `never` at 100,000 appends a second) it is about 2% of a core. A slicing-by-8 table is not needed and is not planned. The figure includes the benchmark's loop and a modulo per round, so it slightly overstates the checksum.
+
 ## 11. Plan, and what each step needs from lex-sys
 
 | step | builds | needs from lex-sys |
 |---|---|---|
-| **L0** | the record format, CRC-32C, the segment and manifest code, recovery, and the byte-by-byte sweep (section 6). No network. | `file-writes.md` slices 1 and 2: **built** |
+| **L0** | the record format and CRC-32C (**built**: `src/crc.ls`, `src/record.ls`, tests and mutation checked), then the segment and manifest code, recovery, and the byte-by-byte sweep (section 6). No network. | `file-writes.md` slices 1 and 2: **built** |
 | **L1** | the RESP loop (copied from `lexsys-cache` with attribution, to be extracted as a package once two projects use it), `XADD`, `XLEN`, `XRANGE`, `XREAD`, the handshake, the differential harness | nothing new |
 | **L2** | consumer groups: the group log, snapshotting by rename, `XREADGROUP`, `XACK`, `XPENDING`, `XCLAIM` | nothing new |
 | **L3** | trimming, `XDEL` tombstones, the `interval` policy, the measurements of section 10 | `fdatasync` if the gate's caveat bites |
