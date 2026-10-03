@@ -52,7 +52,7 @@ jobs:
         working-directory: log
         run: |
           mkdir -p build
-          ../lex-sys/target/release/lex-sys build src/logtool.ls src/segment.ls src/record.ls src/crc.ls --std -o build/logtool
+          ../lex-sys/target/release/lex-sys build src/logtool.ls src/log.ls src/segment.ls src/record.ls src/crc.ls --std -o build/logtool
 
       - name: The crash sweep (cuts, torn blocks, id order, a log longer than the window, sealed bit flips)
         working-directory: log
