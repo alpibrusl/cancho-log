@@ -8,8 +8,9 @@ on:
 env:
   # The compiler these sources are built and tested with: part of the contract, since a source file does not record which
   # `std` it was written against. This is lex-sys's main after packages across repositories (#192) were merged, which
-  # `vcs publish --dir` (the committed stores below) needs.
-  LEX_SYS_REV: f804ce7e6fcf5717ea52442bf648a1fe81090f98
+  # `vcs publish --dir` (the committed stores below) needs. Moved to ab28046 (lex-sys#286), after lex-sys db7d5bc made a
+  # static's signature carry its name: `crc_table`'s signature changed, and a store published before it is refused.
+  LEX_SYS_REV: ab28046dbcd8cc3b7149522a52f2453ceb0d0f4a
 
 jobs:
   test:
