@@ -1,8 +1,8 @@
-# lexsys-log
+# cancho-log
 
-[![ci](https://github.com/alpibrusl/lexsys-log/actions/workflows/ci.yml/badge.svg)](https://github.com/alpibrusl/lexsys-log/actions/workflows/ci.yml)
+[![ci](https://github.com/alpibrusl/cancho-log/actions/workflows/ci.yml/badge.svg)](https://github.com/alpibrusl/cancho-log/actions/workflows/ci.yml)
 
-A durable, segmented, append-only log, written in [lex-sys](https://github.com/alpibrusl/lex-sys): no `Ffi`, no `unsafe`, and a
+A durable, segmented, append-only log, written in [cancho](https://github.com/alpibrusl/cancho): no `Ffi`, no `unsafe`, and a
 checkable authority report.
 
 It is the engine meant to sit under a stream and queue server (Redis Streams over RESP first) and, later, a
@@ -14,15 +14,15 @@ It is **not** a Kafka replacement: one node, no replication, no consensus.
 
 ## Status
 
-**L0, the append path built.** Done: the checksum (`src/crc.ls`), the record format (`src/record.ls`), the scan and recovery of
-a segment (`src/segment.ls`), and the append path (`src/log.ls`: append, flush, read-back, group flush). Each is tested from
+**L0, the append path built.** Done: the checksum (`src/crc.cho`), the record format (`src/record.cho`), the scan and recovery of
+a segment (`src/segment.cho`), and the append path (`src/log.cho`: append, flush, read-back, group flush). Each is tested from
 bytes and by a crash sweep against an independent reader. Not yet: rolling segments, the manifest, an index, consumer groups,
 the Redis Streams front-end, trail mode. [`docs/design.md`](docs/design.md) is the plan; its measurements are of Redis, of
 the disk and of the checksum, not yet of this engine.
 
 ## Requirements
 
-- The **lex-sys** compiler, at the revision this repository's CI builds and tests with (below). A source file does not record
+- The **cancho** compiler, at the revision this repository's CI builds and tests with (below). A source file does not record
   the `std` it was written against, so the revision is part of the contract.
 - Rust, to build that compiler (its `rust-toolchain.toml` pins the toolchain).
 - `python3`, for the crash sweep.
@@ -30,16 +30,16 @@ the disk and of the checksum, not yet of this engine.
 ## Quick start
 
 ```sh
-git clone https://github.com/alpibrusl/lex-sys
-git clone https://github.com/alpibrusl/lexsys-log && cd lexsys-log
+git clone https://github.com/alpibrusl/cancho
+git clone https://github.com/alpibrusl/cancho-log && cd cancho-log
 
-REV=$(sed -n 's/^ *LEX_SYS_REV: *//p' .github/workflows/ci.yml)    # the revision CI uses
-(cd ../lex-sys && git checkout "$REV" && cargo build --release -p lex-sys)
-export LEX_SYS=$PWD/../lex-sys/target/release/lex-sys
+REV=$(sed -n 's/^ *CANCHO_REV: *//p' .github/workflows/ci.yml)    # the revision CI uses
+(cd ../cancho && git checkout "$REV" && cargo build --release -p cancho)
+export CANCHO=$PWD/../cancho/target/release/cancho
 
 # logtool is the small command line the crash sweep drives: it writes, dumps and recovers one segment
 mkdir -p build
-$LEX_SYS build src/logtool.ls src/log.ls src/segment.ls src/record.ls src/crc.ls --std -o build/logtool
+$CANCHO build src/logtool.cho src/log.cho src/segment.cho src/record.cho src/crc.cho --std -o build/logtool
 
 mkdir /tmp/demo && build/logtool write /tmp/demo 5 2 1     # append 5 records, flush every 2
 build/logtool dump /tmp/demo                               # read them back through the log
@@ -52,8 +52,8 @@ valid data ends, and how many records it holds.
 
 ## Examples
 
-**Use the log from a program.** This is the shape [`lexsys-hooks`](https://github.com/alpibrusl/lexsys-hooks) uses (see
-`open_log` and its `POST /events` handler in `src/hooks.ls` there for the whole, working version). The caller opens the files,
+**Use the log from a program.** This is the shape [`cancho-hooks`](https://github.com/alpibrusl/cancho-hooks) uses (see
+`open_log` and its `POST /events` handler in `src/hooks.cho` there for the whole, working version). The caller opens the files,
 so the log needs no capability of its own:
 
 ```
@@ -81,20 +81,20 @@ clients with an error, never an acknowledgement.
 
 ## Using it from another program
 
-The four modules are published as [lex-sys](https://github.com/alpibrusl/lex-sys) packages in `.lex-sys-vcs/` (one store per
+The four modules are published as [cancho](https://github.com/alpibrusl/cancho) packages in `.cancho-vcs/` (one store per
 module, `log` requiring the rest), so a program pins this repository by commit instead of cloning it next to its own:
 
 ```sh
-LOG=<a full commit hash of lexsys-log>
-lex-sys vcs lock --git https://github.com/alpibrusl/lexsys-log --rev $LOG --path .lex-sys-vcs/log -o deps/log.lock --all
-lex-sys vcs fetch --lock deps/log.lock -o build/deps          # re-checks every pin; writes build/deps/<hash>.ls
-lex-sys build src/main.ls build/deps/*.ls --std -o build/app  # `import log;` and `import record;` resolve against them
+LOG=<a full commit hash of cancho-log>
+cancho vcs lock --git https://github.com/alpibrusl/cancho-log --rev $LOG --path .cancho-vcs/log -o deps/log.lock --all
+cancho vcs fetch --lock deps/log.lock -o build/deps          # re-checks every pin; writes build/deps/<hash>.cho
+cancho build src/main.cho build/deps/*.cho --std -o build/app  # `import log;` and `import record;` resolve against them
 ```
 
 The lock holds the commit hash and the hash of each source, never a branch name; the fetched sources are re-parsed,
 re-typechecked and re-hashed, so what git delivers is checked rather than trusted
-([`lex-sys` `docs/package-system.md`](https://github.com/alpibrusl/lex-sys/blob/main/docs/package-system.md) section 7). CI
-checks that the committed stores are exactly what `lex-sys vcs publish --dir src --store .lex-sys-vcs` makes of the source;
+([`cancho` `docs/package-system.md`](https://github.com/alpibrusl/cancho/blob/main/docs/package-system.md) section 7). CI
+checks that the committed stores are exactly what `cancho vcs publish --dir src --store .cancho-vcs` makes of the source;
 after changing a module, run that command and commit the result.
 
 ## The record
@@ -110,15 +110,15 @@ tested, and the choices behind the format are in [`docs/design.md`](docs/design.
 ## Tests
 
 ```sh
-$LEX_SYS test tests/crc_test.ls src/crc.ls --std                        # CRC-32C: the RFC 3720 vectors and properties
-$LEX_SYS test tests/record_test.ls src/record.ls src/crc.ls --std       # the record format, from bytes
+$CANCHO test tests/crc_test.cho src/crc.cho --std                        # CRC-32C: the RFC 3720 vectors and properties
+$CANCHO test tests/record_test.cho src/record.cho src/crc.cho --std       # the record format, from bytes
 python3 tests/sweep.py build/logtool                                    # the crash sweep, against an independent reader
 ```
 
 The sweep cuts a log at every byte, tears blocks and zeroes their tails, flips bits in sealed segments, and compares what recovery
 keeps with a reader written separately in Python (with its own CRC-32C). It has been mutation-checked: deliberately broken
 copies of the log are killed by it, and the two that survive are documented as unobservable in
-[`docs/design.md`](docs/design.md) section 12. `bench/crc_speed.ls` measures the checksum.
+[`docs/design.md`](docs/design.md) section 12. `bench/crc_speed.cho` measures the checksum.
 
 ## Documentation
 
@@ -129,13 +129,13 @@ copies of the log are killed by it, and the two that survive are documented as u
 ## Layout
 
 ```
-src/crc.ls       CRC-32C
-src/record.ls    the record: build, seal, check, read fields
-src/segment.ls   scan a segment and decide what survives
-src/log.ls       the open log: append, flush, read_at
-src/logtool.ls   the command line the sweep drives
-.lex-sys-vcs/    the modules as lex-sys packages, for locking this repository from another program
-tests/           unit tests (lex-sys) and the crash sweep (Python)
+src/crc.cho       CRC-32C
+src/record.cho    the record: build, seal, check, read fields
+src/segment.cho   scan a segment and decide what survives
+src/log.cho       the open log: append, flush, read_at
+src/logtool.cho   the command line the sweep drives
+.cancho-vcs/    the modules as cancho packages, for locking this repository from another program
+tests/           unit tests (cancho) and the crash sweep (Python)
 bench/           the checksum's speed
 docs/design.md   the plan
 ```
@@ -147,7 +147,7 @@ has covered. Ids are 0 to 2^63-1 and must increase within a log.
 
 ## Contributing
 
-Every change goes through the same steps CI runs: `$LEX_SYS fmt --check src tests bench`, the two unit suites and the crash
+Every change goes through the same steps CI runs: `$CANCHO fmt --check src tests bench`, the two unit suites and the crash
 sweep above. Design before code, in `docs/`, with claims measured; a claim that turns out false is corrected in place.
 
 ## Licence

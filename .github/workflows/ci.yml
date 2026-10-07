@@ -7,10 +7,10 @@ on:
 
 env:
   # The compiler these sources are built and tested with: part of the contract, since a source file does not record which
-  # `std` it was written against. This is lex-sys's main after packages across repositories (#192) were merged, which
-  # `vcs publish --dir` (the committed stores below) needs. Moved to ab28046 (lex-sys#286), after lex-sys db7d5bc made a
+  # `std` it was written against. This is cancho's main after packages across repositories (#192) were merged, which
+  # `vcs publish --dir` (the committed stores below) needs. Moved to ab28046 (cancho#286), after cancho db7d5bc made a
   # static's signature carry its name: `crc_table`'s signature changed, and a store published before it is refused.
-  LEX_SYS_REV: ab28046dbcd8cc3b7149522a52f2453ceb0d0f4a
+  CANCHO_REV: a4572ea3b506e4bcec1c4be43deda1043c11ba9f
 
 jobs:
   test:
@@ -22,39 +22,39 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
-          repository: alpibrusl/lex-sys
-          ref: ${{ env.LEX_SYS_REV }}
-          path: lex-sys
+          repository: alpibrusl/cancho
+          ref: ${{ env.CANCHO_REV }}
+          path: cancho
 
       - name: Cache the compiler
         id: compiler
         uses: actions/cache@v4
         with:
-          path: lex-sys/target/release/lex-sys
-          key: lex-sys-${{ env.LEX_SYS_REV }}
+          path: cancho/target/release/cancho
+          key: cancho-${{ env.CANCHO_REV }}
 
-      - name: Build lex-sys
+      - name: Build cancho
         if: steps.compiler.outputs.cache-hit != 'true'
-        working-directory: lex-sys
-        run: cargo build --release -p lex-sys
+        working-directory: cancho
+        run: cargo build --release -p cancho
 
       - name: Formatting
         working-directory: log
-        run: ../lex-sys/target/release/lex-sys fmt --check src tests bench
+        run: ../cancho/target/release/cancho fmt --check src tests bench
 
       - name: CRC-32C against the RFC 3720 vectors
         working-directory: log
-        run: ../lex-sys/target/release/lex-sys test tests/crc_test.ls src/crc.ls --std
+        run: ../cancho/target/release/cancho test tests/crc_test.cho src/crc.cho --std
 
       - name: The record format, from bytes
         working-directory: log
-        run: ../lex-sys/target/release/lex-sys test tests/record_test.ls src/record.ls src/crc.ls --std
+        run: ../cancho/target/release/cancho test tests/record_test.cho src/record.cho src/crc.cho --std
 
       - name: Build logtool, the command line the crash sweep drives
         working-directory: log
         run: |
           mkdir -p build
-          ../lex-sys/target/release/lex-sys build src/logtool.ls src/log.ls src/segment.ls src/record.ls src/crc.ls --std -o build/logtool
+          ../cancho/target/release/cancho build src/logtool.cho src/log.cho src/segment.cho src/record.cho src/crc.cho --std -o build/logtool
 
       - name: The crash sweep (cuts, torn blocks, id order, a log longer than the window, sealed bit flips)
         working-directory: log
@@ -63,7 +63,7 @@ jobs:
       - name: The committed stores are what the source publishes
         working-directory: log
         run: |
-          ../lex-sys/target/release/lex-sys vcs publish --dir src --store .lex-sys-vcs
-          git diff --exit-code -- .lex-sys-vcs
-          test -z "$(git status --porcelain -- .lex-sys-vcs)"
-          for m in crc record segment log; do ../lex-sys/target/release/lex-sys vcs resolve .lex-sys-vcs/$m; done
+          ../cancho/target/release/cancho vcs publish --dir src --store .cancho-vcs
+          git diff --exit-code -- .cancho-vcs
+          test -z "$(git status --porcelain -- .cancho-vcs)"
+          for m in crc record segment log; do ../cancho/target/release/cancho vcs resolve .cancho-vcs/$m; done
