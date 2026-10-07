@@ -1,0 +1,37 @@
+{
+  "store": "../segment",
+  "lock": {
+    "entries": {
+      "after": {
+        "sig_id": "31201477451211b358ee0a98b87cbd182fad55c0c9aca90ff306a01be1c9c442",
+        "stage_id": "a0a786f84db39571eb1fae12e5f3fd0c9749640437a1094296b331dcc0d415a3",
+        "source_hash": "95c24a020f35d454b0567bdd114f4f68e462ea402a3ca6fddf579b5d520c0b94"
+      },
+      "clean": {
+        "sig_id": "6c1d21da68eeb3e9c038d86e264c93660b672e5414b87fc95e1807981492d906",
+        "stage_id": "d0aa4d0beecc0bb1f31b368ff97ddfef1ceb6158bffecb108260c1eb264da1da",
+        "source_hash": "95c24a020f35d454b0567bdd114f4f68e462ea402a3ca6fddf579b5d520c0b94"
+      },
+      "damaged": {
+        "sig_id": "102e22e57df14fd82c2b91202d8ec20c5c5a75efbf4f88692dbf8a3ca06228e5",
+        "stage_id": "7810a04f84e93f081f1699a63442dca6359b393ebbbd7cc5119ae1106bdb9221",
+        "source_hash": "95c24a020f35d454b0567bdd114f4f68e462ea402a3ca6fddf579b5d520c0b94"
+      },
+      "scan": {
+        "sig_id": "ac1b60049359564bf7ccefd30c5580e834f8e0aacede2a95becca5cc36bd2be0",
+        "stage_id": "bbe102aac6490d3bec049a71a9b0f4822ae9270129f081929feff35a38c52ef7",
+        "source_hash": "95c24a020f35d454b0567bdd114f4f68e462ea402a3ca6fddf579b5d520c0b94"
+      },
+      "torn": {
+        "sig_id": "2a2f044abd6301fafb1ea715a36a3815e75ed201ba56da4c51df332e84171226",
+        "stage_id": "1bc01f8a83a957f4ba0d9ea00b7fc5a1219686f874f369ac9dd99bf113914d12",
+        "source_hash": "95c24a020f35d454b0567bdd114f4f68e462ea402a3ca6fddf579b5d520c0b94"
+      },
+      "unreadable": {
+        "sig_id": "049e5afcc16042888af3929c250547d5829dc954f6c655d7b6838576a4d0175a",
+        "stage_id": "9c3054891592393fe60fa02a7b3db9ace71f3e228aca4a803e2fc500a1441c33",
+        "source_hash": "95c24a020f35d454b0567bdd114f4f68e462ea402a3ca6fddf579b5d520c0b94"
+      }
+    }
+  }
+}
