@@ -10,7 +10,7 @@ env:
   # `std` it was written against. This is cancho's main after packages across repositories (#192) were merged, which
   # `vcs publish --dir` (the committed stores below) needs. Moved to ab28046 (cancho#286), after cancho db7d5bc made a
   # static's signature carry its name: `crc_table`'s signature changed, and a store published before it is refused.
-  CANCHO_REV: a4572ea3b506e4bcec1c4be43deda1043c11ba9f
+  CANCHO_REV: f4ead824f33b291a0ad7620a34a0c1346a7abe4f
 
 jobs:
   test:
