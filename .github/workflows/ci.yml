@@ -50,6 +50,19 @@ jobs:
         working-directory: log
         run: ../cancho/target/release/cancho test tests/record_test.cho src/record.cho src/crc.cho --std
 
+      - name: Trail mode, the rules and lex-trail's vectors
+        working-directory: log
+        run: |
+          ../cancho/target/release/cancho test tests/trail_test.cho src/trail.cho src/record.cho src/crc.cho src/log.cho src/segment.cho --std
+          ../cancho/target/release/cancho test tests/trail_vectors_test.cho src/trail.cho src/record.cho src/crc.cho src/log.cho src/segment.cho --std
+
+      - name: Build trailtool and run the trail sweep against the independent model
+        working-directory: log
+        run: |
+          mkdir -p build
+          ../cancho/target/release/cancho build src/trailtool.cho src/trail.cho src/log.cho src/segment.cho src/record.cho src/crc.cho --std -o build/trailtool
+          python3 tests/trail_sweep.py build/trailtool
+
       - name: Build logtool, the command line the crash sweep drives
         working-directory: log
         run: |
@@ -63,7 +76,7 @@ jobs:
       - name: The committed stores are what the source publishes
         working-directory: log
         run: |
-          ../cancho/target/release/cancho vcs publish --dir src --store .cancho-vcs
+          ../cancho/target/release/cancho vcs publish --dir src --store .cancho-vcs --std
           git diff --exit-code -- .cancho-vcs
           test -z "$(git status --porcelain -- .cancho-vcs)"
-          for m in crc record segment log; do ../cancho/target/release/cancho vcs resolve .cancho-vcs/$m; done
+          for m in crc record segment log trail; do ../cancho/target/release/cancho vcs resolve .cancho-vcs/$m; done

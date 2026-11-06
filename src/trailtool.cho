@@ -1,0 +1,282 @@
+edition 5;
+
+import std.io;
+import std.buffer;
+import crc;
+import record;
+import segment;
+import log;
+import trail;
+
+// `trailtool` -- trail mode from a command line, for the sweep (`tests/trail_sweep.py`) and for a person (`docs/trail.md`):
+//
+//     trailtool append <dir> <parent> <kind> <payload> <ts_ms>
+//         recover <dir>/0.seg, verify it, append one event and flush. <parent> is `-` for none, `@` for the current head, or
+//         64 hex digits. Prints `append <status> <detail>` and `head <id>`; exit 0 if written or already there (status 1).
+//     trailtool verify <dir> [<count> <id>]
+//         walk <dir>/0.seg without changing it. Prints `verdict <v> valid_end <n> events <n> why <w> anchor <a>` and `head <id>`.
+//         With `<count> <id>`, the event number <count> (from 1) must have that id.
+//
+// Exit status: 0 good, 3 the file is not a good chain (verify) or the append was refused, 100+ an I/O error. It is a test tool:
+// it holds the unnarrowed filesystem so that the directory can come from the command line.
+
+fn max_len() -> [] int {
+    return 65536;
+}
+
+fn parse[&r](s: &r [byte]) -> [] int {
+    var n = 0;
+    var i = 0;
+    while i < len(s) {
+        // Saturating: a number of 10^18 or more stays at or above it (and so is refused as a time) and never overflows.
+        if n < 1000000000000000000 {
+            n = n * 10 + (int_of(s[i]) - 48);
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn seg_path[&r, &o](out: &!o [byte], dir: &r [byte]) -> [] int {
+    var i = 0;
+    while i < len(dir) {
+        out[i] = dir[i];
+        i = i + 1;
+    }
+    let name = "/0.seg";
+    var j = 0;
+    while j < len(name) {
+        out[i + j] = name[j];
+        j = j + 1;
+    }
+    return i + len(name);
+}
+
+fn say[&i, &r](io: &!i Io, word: &r [byte], value: int) -> [io_write] int {
+    io.write_all(io, word);
+    io.space(io);
+    io.print_int(io, value);
+    return 0;
+}
+
+fn print_verify[&i](io: &!i Io, r: (int, int, int, int, int)) -> [io_write] int {
+    say(io, "verdict", r.0);
+    io.space(io);
+    say(io, "valid_end", r.1);
+    io.space(io);
+    say(io, "events", r.2);
+    io.space(io);
+    say(io, "why", r.3);
+    io.space(io);
+    say(io, "anchor", r.4);
+    io.newline(io);
+    return 0;
+}
+
+fn print_head[&i, &h](io: &!i Io, head: &h [byte], events: int) -> [io_write] int {
+    io.write_all(io, "head ");
+    if events > 0 {
+        io.write_all(io, head[0..64]);
+    } else {
+        io.write_all(io, "-");
+    }
+    io.newline(io);
+    return 0;
+}
+
+fn cmd_verify[&c, &i, &r, &w, &x](fs: &c Fs(""), io: &!i Io, dir: &r [byte], anchor_count: int, anchor_head: &x [byte], window: &!w [byte]) -> [fs_read(""), file_read, io_write] int {
+    var status = 0;
+    region a {
+        let path_buf = alloc_slice[a](4096, byte_of(0));
+        let path = path_buf[0..seg_path(path_buf, dir)];
+        let head = alloc_slice[a](64, byte_of(0));
+        match open_read(fs, path) {
+            Opened::Failed(e) => {
+                status = 100 + e;
+            }
+            Opened::Ok(opened) => {
+                var file = opened;
+                borrow mut file as &!h in {
+                    match file_size(h) {
+                        Done::Failed(e) => {
+                            status = 110 + e;
+                        }
+                        Done::Ok(size) => {
+                            let v = trail.verify(h, size, window, max_len(), head, anchor_count, anchor_head);
+                            print_verify(io, v);
+                            print_head(io, head, v.2);
+                            if v.0 != trail.clean() || v.4 == trail.anchor_short() || v.4 == trail.anchor_mismatch() {
+                                status = 3;
+                            }
+                        }
+                    }
+                }
+                file_close(file);
+            }
+        }
+    }
+    return status;
+}
+
+fn cmd_append[&c, &i, &r, &k, &y, &w](fs: &c Fs(""), io: &!i Io, dir: &r [byte], parent_arg: &k [byte], kind: &k [byte], payload: &y [byte], ts_ms: int, window: &!w [byte]) -> [fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    var status = 0;
+    region a {
+        let path_buf = alloc_slice[a](4096, byte_of(0));
+        let path = path_buf[0..seg_path(path_buf, dir)];
+        let head = alloc_slice[a](64, byte_of(0));
+        let scratch = alloc_slice[a](4096, byte_of(0));
+        match open_append(fs, path) {
+            Opened::Failed(e) => {
+                status = 100 + e;
+            }
+            Opened::Ok(w) => {
+                match open_rw(fs, path) {
+                    Opened::Failed(e) => {
+                        status = 100 + e;
+                        file_close(w);
+                    }
+                    Opened::Ok(rw0) => {
+                        var rw = rw0;
+                        var rec = (0, 0, 0, 0 - 1, 0 - 1);
+                        var v = (0, 0, 0, 0, 0);
+                        borrow mut rw as &!x in {
+                            rec = log.recover(x, window, max_len());
+                            if rec.0 == 0 {
+                                v = trail.verify(x, rec.1, window, max_len(), head, 0, "");
+                            }
+                        }
+                        file_close(rw);
+                        if rec.0 != 0 {
+                            status = 140;
+                            file_close(w);
+                        } else if v.0 != trail.clean() {
+                            // Not a good chain: nothing is added to it.
+                            print_verify(io, v);
+                            status = 3;
+                            file_close(w);
+                        } else {
+                            match open_read(fs, path) {
+                                Opened::Failed(e) => {
+                                    status = 100 + e;
+                                    file_close(w);
+                                }
+                                Opened::Ok(rd) => {
+                                    var lg = log.attach(w, rd, rec.1, rec.2, rec.3, rec.4, max_len());
+                                    // The parent is copied: `head` is lent mutably to `append`, which compares against it.
+                                    let par = alloc_slice[a](128, byte_of(0));
+                                    var plen = len(parent_arg);
+                                    if plen > 127 {
+                                        plen = 127;
+                                    }
+                                    var q = 0;
+                                    while q < plen {
+                                        par[q] = parent_arg[q];
+                                        q = q + 1;
+                                    }
+                                    if len(parent_arg) == 1 && int_of(parent_arg[0]) == 45 {
+                                        plen = 0;
+                                    }
+                                    if len(parent_arg) == 1 && int_of(parent_arg[0]) == 64 {
+                                        plen = 0;
+                                        if v.2 > 0 {
+                                            plen = 64;
+                                            q = 0;
+                                            while q < 64 {
+                                                par[q] = head[q];
+                                                q = q + 1;
+                                            }
+                                        }
+                                    }
+                                    let parent = par[0..plen];
+                                    borrow mut lg as &!l in {
+                                        let r = trail.append(l, head, scratch, kind, parent, payload, ts_ms, max_len());
+                                        say(io, "append", r.0);
+                                        io.space(io);
+                                        io.print_int(io, r.1);
+                                        io.newline(io);
+                                        if r.0 == 0 {
+                                            status = log.flush(l);
+                                        } else if r.0 != 1 {
+                                            status = 3;
+                                        }
+                                        print_head(io, head, log.records(l));
+                                    }
+                                    log.close(lg);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return status;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock } = split(world);
+    release(ffi);
+    release(net);
+    release(clock);
+    var status = 2;
+    var pool = heap;
+    var out = io;
+    borrow mut pool as &!hp in {
+        var wbuf = buffer.empty(hp, max_len() + 4096);
+        region a {
+            let words = alloc_slice[a](8192, byte_of(0));
+            let starts = alloc_slice[a](8, 0);
+            let lens = alloc_slice[a](8, 0);
+            var count = 0;
+            borrow args as &g in {
+                var at = 0;
+                count = arg_count(g);
+                if count > 8 {
+                    count = 8;
+                }
+                var n = 0;
+                while n < count {
+                    let w = arg(g, n);
+                    starts[n] = at;
+                    lens[n] = len(w);
+                    var k = 0;
+                    while k < len(w) && at < 8192 {
+                        words[at] = w[k];
+                        at = at + 1;
+                        k = k + 1;
+                    }
+                    n = n + 1;
+                }
+            }
+            if count >= 3 {
+                let cmd = words[starts[1]..starts[1] + lens[1]];
+                let dir = words[starts[2]..starts[2] + lens[2]];
+                borrow fs as &c in {
+                    borrow mut out as &!o in {
+                        if lens[1] == 6 && int_of(cmd[0]) == 97 && count >= 7 {
+                            borrow mut wbuf as &!wb in {
+                                status = cmd_append(c, o, dir, words[starts[3]..starts[3] + lens[3]], words[starts[4]..starts[4] + lens[4]], words[starts[5]..starts[5] + lens[5]], parse(words[starts[6]..starts[6] + lens[6]]), buffer.room(wb));
+                            }
+                        } else if lens[1] == 6 && int_of(cmd[0]) == 118 {
+                            var ac = 0;
+                            var ah = words[0..0];
+                            if count >= 5 {
+                                ac = parse(words[starts[3]..starts[3] + lens[3]]);
+                                ah = words[starts[4]..starts[4] + lens[4]];
+                            }
+                            borrow mut wbuf as &!wb in {
+                                status = cmd_verify(c, o, dir, ac, ah, buffer.room(wb));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        buffer.drop(hp, wbuf);
+    }
+    release(args);
+    release(fs);
+    release(out);
+    release(pool);
+    return status;
+}

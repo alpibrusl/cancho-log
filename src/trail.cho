@@ -1,0 +1,606 @@
+edition 5;
+
+module trail;
+
+import std.crypto;
+import record;
+import log;
+
+// `trail` -- lex-trail events on this log (`docs/trail.md`; the format is lex-trail's `SPEC.md`).
+//
+// An event is `(kind, parent, payload, ts_ms)` and its id is `hex(sha256(kind NUL parent NUL payload NUL decimal(ts_ms)))`,
+// the payload hashed as text. It is stored as one record of five pairs, in this order and no other:
+//
+//     id  kind  parent  payload  ts_ms
+//
+// and the record's own id (ms, seq) is not a free choice: it is derived from `ts_ms` and the record before, so that a
+// record whose id disagrees with its event is refused (`derive`).
+//
+// **The chain is linear.** An event's parent is the id of the event before it, and the first has the empty parent. lex-trail
+// allows a tree; this engine is a log, and a log has one head. Appending takes the parent explicitly, so a retry of an
+// append whose answer was lost is recognised (the event is already the head) instead of being written twice.
+//
+// **What this proves** is lex-trail's, no more (`docs/trail.md` section 2): an edited event fails its id, a deleted or
+// reordered one breaks the parent link, and cutting off the tail or rewriting the whole chain consistently verifies
+// unless the caller holds an anchor `(count, head)` from somewhere the log's owner cannot reach.
+
+// ---------------------------------------------------------------------
+// Answers
+// ---------------------------------------------------------------------
+
+// `check_event`'s answers (0 is fine).
+pub fn bad_kind() -> [] int {
+    return 2;
+}
+
+pub fn bad_parent() -> [] int {
+    return 3;
+}
+
+pub fn bad_payload() -> [] int {
+    return 4;
+}
+
+pub fn bad_time() -> [] int {
+    return 5;
+}
+
+// `append`'s first answer. 0 written; 1 the event is already the head (a retry; nothing written); 2..5 are `check_event`'s;
+// the rest follow.
+pub fn parent_not_head() -> [] int {
+    return 6;
+}
+
+pub fn too_long() -> [] int {
+    return 7;
+}
+
+pub fn broken() -> [] int {
+    return 8;
+}
+
+// A write failed (the second answer is the errno); the log is broken now.
+pub fn write_failed() -> [] int {
+    return 9;
+}
+
+// `verify`'s verdicts: the first four are `segment`'s numbering.
+pub fn clean() -> [] int {
+    return 0;
+}
+
+pub fn torn() -> [] int {
+    return 1;
+}
+
+pub fn damaged() -> [] int {
+    return 2;
+}
+
+pub fn unreadable() -> [] int {
+    return 3;
+}
+
+// Every record is whole, and the event in one of them is not valid or does not follow the one before.
+pub fn broken_chain() -> [] int {
+    return 4;
+}
+
+// `verify`'s anchor answers.
+pub fn anchor_none() -> [] int {
+    return 0;
+}
+
+pub fn anchor_confirmed() -> [] int {
+    return 1;
+}
+
+// Fewer events than the anchor counted: the tail was cut, or the anchor is from another log.
+pub fn anchor_short() -> [] int {
+    return 2;
+}
+
+// The log has that many events and the one at that place is not the anchor's.
+pub fn anchor_mismatch() -> [] int {
+    return 3;
+}
+
+// The longest id (and so the head buffer's size).
+pub fn id_len() -> [] int {
+    return 64;
+}
+
+// An event time is at most this many decimal digits: below 10^18, so it is below 2^62 and a record id can hold it.
+fn time_digits() -> [] int {
+    return 18;
+}
+
+// ---------------------------------------------------------------------
+// Small pieces
+// ---------------------------------------------------------------------
+
+fn same[&a, &b](x: &a [byte], y: &b [byte]) -> [] bool {
+    if len(x) != len(y) {
+        return false;
+    }
+    var i = 0;
+    while i < len(x) {
+        if int_of(x[i]) != int_of(y[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn has_nul[&a](x: &a [byte]) -> [] bool {
+    var i = 0;
+    while i < len(x) {
+        if int_of(x[i]) == 0 {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// 0-9a-f only: the digits a lowercase hex id is made of.
+fn is_hex(c: int) -> [] bool {
+    return c >= 48 && c <= 57 || c >= 97 && c <= 102;
+}
+
+fn is_id[&a](x: &a [byte]) -> [] bool {
+    if len(x) != 64 {
+        return false;
+    }
+    var i = 0;
+    while i < 64 {
+        if !is_hex(int_of(x[i])) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// How many decimal digits `v` (0 or more) takes.
+pub fn decimal_len(v: int) -> [] int {
+    var n = 1;
+    var t = v;
+    while t >= 10 {
+        t = t / 10;
+        n = n + 1;
+    }
+    return n;
+}
+
+// `v` (0 or more) in decimal at `at`; answers where it ends.
+fn put_decimal[&o](out: &!o [byte], at: int, v: int) -> [] int {
+    let n = decimal_len(v);
+    var t = v;
+    var i = n - 1;
+    while i >= 0 {
+        out[at + i] = byte_of(48 + t % 10);
+        t = t / 10;
+        i = i - 1;
+    }
+    return at + n;
+}
+
+fn hex_digit(v: int) -> [] int {
+    if v < 10 {
+        return 48 + v;
+    }
+    return 87 + v;
+}
+
+// ---------------------------------------------------------------------
+// The event
+// ---------------------------------------------------------------------
+
+// Is `(kind, parent, payload, ts_ms)` an event this engine will store? Answers 0, or `bad_kind` (empty, or holds a NUL: the
+// NUL is the separator and carries the format's weight), `bad_parent` (not empty and not 64 lowercase hex digits),
+// `bad_payload` (holds a NUL; the payload is otherwise not looked at: it is hashed as text, not as JSON), `bad_time` (below
+// 0 or from 10^18 up).
+pub fn check_event[&k, &p, &l](kind: &k [byte], parent: &p [byte], payload: &l [byte], ts_ms: int) -> [] int {
+    if len(kind) == 0 || has_nul(kind) {
+        return bad_kind();
+    }
+    if len(parent) != 0 && !is_id(parent) {
+        return bad_parent();
+    }
+    if has_nul(payload) {
+        return bad_payload();
+    }
+    if ts_ms < 0 || decimal_len(ts_ms) > time_digits() {
+        return bad_time();
+    }
+    return 0;
+}
+
+// The event's id, as 64 lowercase hex digits written to `out[0..64]`. The inputs must have passed `check_event` (an
+// unchecked NUL would still hash, to an id no other implementation shares).
+pub fn event_id[&k, &p, &l, &o](kind: &k [byte], parent: &p [byte], payload: &l [byte], ts_ms: int, out: &!o [byte]) -> [] int {
+    region a {
+        let state = alloc_slice[a](138, 0);
+        let digits = alloc_slice[a](24, byte_of(0));
+        let nul = alloc_slice[a](1, byte_of(0));
+        let digest = alloc_slice[a](32, byte_of(0));
+        let n = put_decimal(digits, 0, ts_ms);
+        crypto.sha256_init(state);
+        crypto.sha256_update(state, kind);
+        crypto.sha256_update(state, nul);
+        crypto.sha256_update(state, parent);
+        crypto.sha256_update(state, nul);
+        crypto.sha256_update(state, payload);
+        crypto.sha256_update(state, nul);
+        crypto.sha256_update(state, digits[0..n]);
+        crypto.sha256_final(state, digest);
+        var i = 0;
+        while i < 32 {
+            let b = int_of(digest[i]);
+            out[2 * i] = byte_of(hex_digit(b >> 4));
+            out[2 * i + 1] = byte_of(hex_digit(b & 15));
+            i = i + 1;
+        }
+    }
+    return 0;
+}
+
+// The anchor digest of lex-trail's `SPEC.md` section 3: the ids sorted as byte strings, joined with a space, SHA-256, lowercase
+// hex. `ids` holds the ids one after the other, each followed by one NUL (an id never holds one); `count` of them. The digest is
+// written to `out[0..64]`. Answers 0, or -1 if `ids` does not hold `count` NUL-terminated ids. The sort is insertion: the work
+// is the square of `count`, and an anchor is made rarely and over a chain this log holds in memory anyway.
+pub fn anchor_digest[&d, &o](ids: &d [byte], count: int, out: &!o [byte]) -> [] int {
+    var status = 0;
+    region a {
+        let starts = alloc_slice[a](count + 1, 0);
+        let ends = alloc_slice[a](count + 1, 0);
+        var n = 0;
+        var at = 0;
+        var from = 0;
+        while at < len(ids) && n < count {
+            if int_of(ids[at]) == 0 {
+                starts[n] = from;
+                ends[n] = at;
+                n = n + 1;
+                from = at + 1;
+            }
+            at = at + 1;
+        }
+        if n != count {
+            status = 0 - 1;
+        } else {
+            // Insertion sort of the (start, end) pairs by the bytes they name.
+            var i = 1;
+            while i < count {
+                let s = starts[i];
+                let e = ends[i];
+                var j = i;
+                while j > 0 && later(ids, starts[j - 1], ends[j - 1], s, e) {
+                    starts[j] = starts[j - 1];
+                    ends[j] = ends[j - 1];
+                    j = j - 1;
+                }
+                starts[j] = s;
+                ends[j] = e;
+                i = i + 1;
+            }
+            let state = alloc_slice[a](138, 0);
+            let digest = alloc_slice[a](32, byte_of(0));
+            let space = alloc_slice[a](1, byte_of(32));
+            crypto.sha256_init(state);
+            var k = 0;
+            while k < count {
+                if k > 0 {
+                    crypto.sha256_update(state, space);
+                }
+                crypto.sha256_update(state, ids[starts[k]..ends[k]]);
+                k = k + 1;
+            }
+            crypto.sha256_final(state, digest);
+            var m = 0;
+            while m < 32 {
+                let b = int_of(digest[m]);
+                out[2 * m] = byte_of(hex_digit(b >> 4));
+                out[2 * m + 1] = byte_of(hex_digit(b & 15));
+                m = m + 1;
+            }
+        }
+    }
+    return status;
+}
+
+// Does the string `ids[s1..e1]` sort after `ids[s2..e2]`, as byte strings?
+fn later[&d](ids: &d [byte], s1: int, e1: int, s2: int, e2: int) -> [] bool {
+    var i = 0;
+    while s1 + i < e1 && s2 + i < e2 {
+        let x = int_of(ids[s1 + i]);
+        let y = int_of(ids[s2 + i]);
+        if x != y {
+            return x > y;
+        }
+        i = i + 1;
+    }
+    return e1 - s1 > e2 - s2;
+}
+
+// ---------------------------------------------------------------------
+// The record
+// ---------------------------------------------------------------------
+
+// The record id an event gets: `ms` is the event time, or the previous record's `ms` if that is later (time does not run
+// backwards in a log); `seq` counts the records that share an `ms`. `prev_ms` and `prev_seq` are -1 and -1 before the first.
+// Answers `(ms, seq)`.
+pub fn derive(ts_ms: int, prev_ms: int, prev_seq: int) -> [] (int, int) {
+    var ms = ts_ms;
+    if prev_ms > ms {
+        ms = prev_ms;
+    }
+    if ms == prev_ms {
+        return (ms, prev_seq + 1);
+    }
+    return (ms, 0);
+}
+
+// The size of the record `encode` writes.
+pub fn encoded_len(kind_len: int, parent_len: int, payload_len: int, ts_ms: int) -> [] int {
+    return 28 + (4 + 2 + 4 + 64) + (4 + 4 + 4 + kind_len) + (4 + 6 + 4 + parent_len) + (4 + 7 + 4 + payload_len) + (4 + 5 + 4 + decimal_len(ts_ms));
+}
+
+// Write the event as a sealed record at `at` in `out`, which must have `encoded_len` bytes there, with record id `(ms, seq)`.
+// The event must have passed `check_event`. Answers the record's size.
+pub fn encode[&o, &k, &p, &l](out: &!o [byte], at: int, kind: &k [byte], parent: &p [byte], payload: &l [byte], ts_ms: int, ms: int, seq: int) -> [] int {
+    var total = 0;
+    region a {
+        let id = alloc_slice[a](64, byte_of(0));
+        let digits = alloc_slice[a](24, byte_of(0));
+        event_id(kind, parent, payload, ts_ms, id);
+        let n = put_decimal(digits, 0, ts_ms);
+        var q = record.begin(out, at, ms, seq, 5);
+        q = record.put_pair(out, q, "id", id);
+        q = record.put_pair(out, q, "kind", kind);
+        q = record.put_pair(out, q, "parent", parent);
+        q = record.put_pair(out, q, "payload", payload);
+        q = record.put_pair(out, q, "ts_ms", digits[0..n]);
+        total = record.seal(out, at, q);
+    }
+    return total;
+}
+
+// ---------------------------------------------------------------------
+// Checking one record
+// ---------------------------------------------------------------------
+
+// Why a whole record is not a valid next event (`check_record`'s answers; 0 is valid).
+pub fn why_shape() -> [] int {
+    return 1;
+}
+
+pub fn why_field() -> [] int {
+    return 2;
+}
+
+pub fn why_id() -> [] int {
+    return 3;
+}
+
+pub fn why_parent() -> [] int {
+    return 4;
+}
+
+pub fn why_record_id() -> [] int {
+    return 5;
+}
+
+// Is the record at `at` in `buf` (which `record.check` has passed) the valid next event after the head `prev_head` (empty before
+// the first), whose record id was `(prev_ms, prev_seq)`? The checks, in order: five pairs named as above; each field valid
+// (`check_event`, the id 64 lowercase hex digits, the time canonical decimal: no sign, no leading zero, no more than 18 digits);
+// the stored id equals the recomputed one; the parent is the previous head; the record's own id is `derive`d.
+pub fn check_record[&b, &h](buf: &b [byte], at: int, prev_head: &h [byte], prev_ms: int, prev_seq: int) -> [] int {
+    if record.fields_of(buf, at) != 5 {
+        return why_shape();
+    }
+    let p0 = record.pair_at(buf, record.first_pair(at));
+    let p1 = record.pair_at(buf, p0.4);
+    let p2 = record.pair_at(buf, p1.4);
+    let p3 = record.pair_at(buf, p2.4);
+    let p4 = record.pair_at(buf, p3.4);
+    if !same(buf[p0.0..p0.0 + p0.1], "id") || !same(buf[p1.0..p1.0 + p1.1], "kind") || !same(buf[p2.0..p2.0 + p2.1], "parent") || !same(buf[p3.0..p3.0 + p3.1], "payload") || !same(buf[p4.0..p4.0 + p4.1], "ts_ms") {
+        return why_shape();
+    }
+    let id = buf[p0.2..p0.2 + p0.3];
+    let kind = buf[p1.2..p1.2 + p1.3];
+    let parent = buf[p2.2..p2.2 + p2.3];
+    let payload = buf[p3.2..p3.2 + p3.3];
+    let digits = buf[p4.2..p4.2 + p4.3];
+    // The time: 1 to 18 digits, no leading zero unless it is "0".
+    if len(digits) == 0 || len(digits) > time_digits() {
+        return why_field();
+    }
+    if len(digits) > 1 && int_of(digits[0]) == 48 {
+        return why_field();
+    }
+    var ts = 0;
+    var i = 0;
+    while i < len(digits) {
+        let c = int_of(digits[i]);
+        if c < 48 || c > 57 {
+            return why_field();
+        }
+        ts = ts * 10 + (c - 48);
+        i = i + 1;
+    }
+    if !is_id(id) || check_event(kind, parent, payload, ts) != 0 {
+        return why_field();
+    }
+    var bad = 0;
+    region a {
+        let again = alloc_slice[a](64, byte_of(0));
+        event_id(kind, parent, payload, ts, again);
+        if !same(again, id) {
+            bad = why_id();
+        }
+    }
+    if bad != 0 {
+        return bad;
+    }
+    if !same(parent, prev_head) {
+        return why_parent();
+    }
+    let want = derive(ts, prev_ms, prev_seq);
+    if record.ms_of(buf, at) != want.0 || record.seq_of(buf, at) != want.1 {
+        return why_record_id();
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------
+// Verifying a file
+// ---------------------------------------------------------------------
+
+// Walk `file` (length `size`) from the front, check every record and every event, and write the last event's id to
+// `head[0..64]` (if there is one). `window` is at least `max_len + 4` bytes. If `anchor_count` is 1 or more, `anchor_head` is
+// the id the event number `anchor_count` (counting from 1) must have.
+//
+// Answers `(verdict, valid_end, events, why, anchor)`: how the walk ended; the offset of the end of the last good event (so
+// a torn tail starts there, and so does the first bad one); how many good events; for `broken_chain`, `why_*`; and the
+// anchor answer. A walk that stops early reports `anchor_short` for an anchor it did not reach, which is the truth about
+// the part of the log that can be trusted.
+pub fn verify[&f, &w, &h, &x](file: &!f File, size: int, window: &!w [byte], max_len: int, head: &!h [byte], anchor_count: int, anchor_head: &x [byte]) -> [file_read] (int, int, int, int, int) {
+    var anchor = anchor_none();
+    if anchor_count >= 1 {
+        anchor = anchor_short();
+    }
+    if len(window) < max_len + 4 {
+        return (unreadable(), 0, 0, 0, anchor);
+    }
+    var pos = 0;
+    var events = 0;
+    var prev_ms = 0 - 1;
+    var prev_seq = 0 - 1;
+    while pos < size {
+        var want = size - pos;
+        if want > len(window) {
+            want = len(window);
+        }
+        var got = 0;
+        match file_pread(file, pos, window[0..want]) {
+            Read::Got(n) => {
+                got = n;
+            }
+            Read::End => {
+                return (torn(), pos, events, 0, anchor);
+            }
+            Read::Failed(e) => {
+                return (unreadable(), pos, events, 0, anchor);
+            }
+        }
+        var at = 0;
+        var refill = false;
+        while at < got && !refill {
+            let r = record.check(window, at, got, max_len);
+            if r.0 == record.ok() {
+                var prev = head[0..0];
+                if events > 0 {
+                    prev = head[0..64];
+                }
+                let why = check_record(window, at, prev, prev_ms, prev_seq);
+                if why != 0 {
+                    return (broken_chain(), pos + at, events, why, anchor);
+                }
+                // The stored id is the first pair's value, 64 bytes, after "id".
+                let first = record.pair_at(window, record.first_pair(at));
+                var i = 0;
+                while i < 64 {
+                    head[i] = window[first.2 + i];
+                    i = i + 1;
+                }
+                prev_ms = record.ms_of(window, at);
+                prev_seq = record.seq_of(window, at);
+                events = events + 1;
+                if events == anchor_count {
+                    if same(head[0..64], anchor_head) {
+                        anchor = anchor_confirmed();
+                    } else {
+                        anchor = anchor_mismatch();
+                    }
+                }
+                at = at + r.1;
+            } else if r.0 == record.bad() {
+                return (damaged(), pos + at, events, 0, anchor);
+            } else if pos + got < size {
+                refill = true;
+            } else {
+                return (torn(), pos + at, events, 0, anchor);
+            }
+        }
+        pos = pos + at;
+        if at == 0 {
+            return (unreadable(), pos, events, 0, anchor);
+        }
+    }
+    return (clean(), pos, events, 0, anchor);
+}
+
+// ---------------------------------------------------------------------
+// Appending
+// ---------------------------------------------------------------------
+
+// Append the event as the next one. `head` holds the current head id in `head[0..64]` when `log.records` is 1 or more
+// (`verify` leaves it there, and a successful `append` keeps it); `scratch` is at least `encoded_len` bytes.
+//
+// Answers `(status, detail)`. 0: written, `head` is now the new event (not durable until `log.flush`). 1: the event is already
+// the head, so this is a retry and nothing was written. 2 to 5: `check_event`'s. 6: `parent` is not the head. 7: the record
+// would be longer than the log allows, or than `scratch`. 8: the log is broken. 9: the write failed, `detail` is the errno, and
+// the log is broken now.
+pub fn append[&l, &h, &s, &k, &p, &y](lg: &!l log.Log, head: &!h [byte], scratch: &!s [byte], kind: &k [byte], parent: &p [byte], payload: &y [byte], ts_ms: int, max_len: int) -> [file_write] (int, int) {
+    if log.broken(lg) {
+        return (broken(), 0);
+    }
+    let c = check_event(kind, parent, payload, ts_ms);
+    if c != 0 {
+        return (c, 0);
+    }
+    let count = log.records(lg);
+    var current = head[0..0];
+    if count > 0 {
+        current = head[0..64];
+    }
+    if !same(parent, current) {
+        // A retry: the same event is already the head, and what the caller lost was the answer.
+        var retry = false;
+        region a {
+            let id = alloc_slice[a](64, byte_of(0));
+            event_id(kind, parent, payload, ts_ms, id);
+            retry = count > 0 && same(id, current);
+        }
+        if retry {
+            return (1, 0);
+        }
+        return (parent_not_head(), 0);
+    }
+    let need = encoded_len(len(kind), len(parent), len(payload), ts_ms);
+    if need - 4 > max_len || need > len(scratch) {
+        return (too_long(), 0);
+    }
+    let id = derive(ts_ms, log.last_ms(lg), log.last_seq(lg));
+    let total = encode(scratch, 0, kind, parent, payload, ts_ms, id.0, id.1);
+    let r = log.append(lg, scratch[0..total], id.0, id.1);
+    if r == 0 {
+        // The new head is the id just written: the first pair's value, 4 + 2 + 4 bytes into the pairs.
+        var i = 0;
+        while i < 64 {
+            head[i] = scratch[record.first_pair(0) + 10 + i];
+            i = i + 1;
+        }
+        return (0, 0);
+    }
+    if r == log.is_broken() {
+        return (broken(), 0);
+    }
+    if r == log.too_long() {
+        return (too_long(), 0);
+    }
+    return (write_failed(), r);
+}

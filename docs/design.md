@@ -160,6 +160,8 @@ That an acknowledged flush survives a power cut. A process-level test cannot do 
 
 **What the chain proves, and what it cannot.** `lex-trail`'s own `SPEC.md` is exact about this and so is `lex-os-audit`: an id detects an edited payload, and an anchor detects a changed set of events, but **truncation of the tail is invisible** to anything inside the log, and a holder who recomputes every id after an edit hands over something that verifies. The signed seals and checkpoints in `lex-os-audit` exist to close those, and a checkpoint is only worth anything held somewhere the log's owner cannot reach. This engine adds durability to a trail and does not add to what the trail proves: it will not claim tamper-evidence beyond `lex-trail`'s, and trail mode inherits `lex-trail`'s limits, stated in its README the way `lex-trail` states them.
 
+**Built in its first form -- a linear, hash-chained evidence log with lex-trail's ids, verification and external anchors: [`trail.md`](trail.md).** Queries, a tree of parents and the id index below are not.
+
 Trail mode is stage L4 (section 11), after the queue works. It is in this document so that the record format (section 4) does not have to change to hold it: a trail event is a record whose pairs are the event's four fields, and nothing in the engine assumes a record is a Redis entry.
 
 ## 9. The gate, fixed before the code
