@@ -1,0 +1,418 @@
+edition 5;
+
+import std.test;
+import record;
+import trail;
+
+// The rules this engine adds to lex-trail's format (`docs/trail.md`), from bytes: which events are stored, how a record's own
+// id is derived, and every reason `check_record` has for refusing a whole record. The format itself is
+// `tests/trail_vectors_test.cho`; files are `tests/trail_sweep.py`.
+
+fn zeros() -> [] int {
+    return 0;
+}
+
+// Write the event as a record at 0 in `out`; answers its size. `head` is the id of the event before ("" for the first).
+fn put[&o, &k, &p, &l](out: &!o [byte], kind: &k [byte], parent: &p [byte], payload: &l [byte], ts: int, ms: int, seq: int) -> [] int {
+    return trail.encode(out, 0, kind, parent, payload, ts, ms, seq);
+}
+
+// The id stored in the record at 0: its first pair's value.
+fn id_of[&b, &o](buf: &b [byte], out: &!o [byte]) -> [] int {
+    let p = record.pair_at(buf, record.first_pair(0));
+    var i = 0;
+    while i < 64 {
+        out[i] = buf[p.2 + i];
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn test_a_valid_chain_checks_event_by_event() -> [] int {
+    region a {
+        let r1 = alloc_slice[a](512, byte_of(0));
+        let r2 = alloc_slice[a](512, byte_of(0));
+        let id1 = alloc_slice[a](64, byte_of(0));
+        let n1 = put(r1, "meter.reading", "", "{\"wh\":1}", 1000, 1000, 0);
+        id_of(r1, id1);
+        test.assert_eq(trail.check_record(r1, 0, id1[0..0], 0 - 1, 0 - 1), 0);
+        let n2 = put(r2, "settlement", id1, "{}", 2000, 2000, 0);
+        test.assert_eq(trail.check_record(r2, 0, id1, 1000, 0), 0);
+        test.assert_eq(n1, trail.encoded_len(13, 0, 8, 1000));
+        test.assert_eq(n2, trail.encoded_len(10, 64, 2, 2000));
+    }
+    return 0;
+}
+
+fn test_a_second_event_must_name_the_head() -> [] int {
+    region a {
+        let r1 = alloc_slice[a](512, byte_of(0));
+        let r2 = alloc_slice[a](512, byte_of(0));
+        let id1 = alloc_slice[a](64, byte_of(0));
+        let other = alloc_slice[a](64, byte_of(48));
+        put(r1, "k", "", "{}", 1, 1, 0);
+        id_of(r1, id1);
+        // No parent, and a parent that is some other id: both are not the head.
+        put(r2, "k", "", "{}", 2, 2, 0);
+        test.assert_eq(trail.check_record(r2, 0, id1, 1, 0), trail.why_parent());
+        put(r2, "k", other, "{}", 2, 2, 0);
+        test.assert_eq(trail.check_record(r2, 0, id1, 1, 0), trail.why_parent());
+        // The first event must not name a parent.
+        put(r2, "k", id1, "{}", 2, 2, 0);
+        test.assert_eq(trail.check_record(r2, 0, id1[0..0], 0 - 1, 0 - 1), trail.why_parent());
+    }
+    return 0;
+}
+
+fn test_an_edited_event_with_a_fixed_checksum_fails_its_id() -> [] int {
+    region a {
+        let r = alloc_slice[a](512, byte_of(0));
+        let n = put(r, "k", "", "{\"a\":1}", 5, 5, 0);
+        test.assert_eq(trail.check_record(r, 0, r[0..0], 0 - 1, 0 - 1), 0);
+        // Change one payload byte and put the checksum right again: the record is whole, the event is not.
+        let p = record.pair_at(r, record.first_pair(0));
+        let q = record.pair_at(r, p.4);
+        let s = record.pair_at(r, q.4);
+        let t = record.pair_at(r, s.4);
+        r[t.2 + 5] = byte_of(int_of(r[t.2 + 5]) + 1);
+        record.seal(r, 0, n);
+        test.assert_eq(record.check(r, 0, n, 4096).0, record.ok());
+        test.assert_eq(trail.check_record(r, 0, r[0..0], 0 - 1, 0 - 1), trail.why_id());
+    }
+    return 0;
+}
+
+fn test_the_record_id_is_derived_from_the_time() -> [] int {
+    region a {
+        let r = alloc_slice[a](512, byte_of(0));
+        // The first event at 100 is (100, 0); any other id for it is refused.
+        put(r, "k", "", "{}", 100, 100, 0);
+        test.assert_eq(trail.check_record(r, 0, r[0..0], 0 - 1, 0 - 1), 0);
+        put(r, "k", "", "{}", 100, 101, 0);
+        test.assert_eq(trail.check_record(r, 0, r[0..0], 0 - 1, 0 - 1), trail.why_record_id());
+        put(r, "k", "", "{}", 100, 100, 1);
+        test.assert_eq(trail.check_record(r, 0, r[0..0], 0 - 1, 0 - 1), trail.why_record_id());
+    }
+    return 0;
+}
+
+fn test_derive_follows_time_that_does_not_run_backwards() -> [] int {
+    // The first record.
+    let a = trail.derive(100, 0 - 1, 0 - 1);
+    test.assert_eq(a.0, 100);
+    test.assert_eq(a.1, 0);
+    // Later time: a new millisecond, sequence from 0.
+    let b = trail.derive(101, 100, 0);
+    test.assert_eq(b.0, 101);
+    test.assert_eq(b.1, 0);
+    // The same millisecond: the sequence counts.
+    let c = trail.derive(100, 100, 0);
+    test.assert_eq(c.0, 100);
+    test.assert_eq(c.1, 1);
+    // An event stamped earlier than the one before takes the earlier one's millisecond, so ids still increase.
+    let d = trail.derive(50, 100, 3);
+    test.assert_eq(d.0, 100);
+    test.assert_eq(d.1, 4);
+    // Time 0 is a time.
+    let e = trail.derive(0, 0 - 1, 0 - 1);
+    test.assert_eq(e.0, 0);
+    test.assert_eq(e.1, 0);
+    return 0;
+}
+
+fn test_events_that_are_not_stored() -> [] int {
+    let id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    test.assert_eq(trail.check_event("k", "", "{}", 0), 0);
+    test.assert_eq(trail.check_event("k", id, "", 999999999999999999), 0);
+    test.assert_eq(trail.check_event("", "", "{}", 0), trail.bad_kind());
+    test.assert_eq(trail.check_event("a\0b", "", "{}", 0), trail.bad_kind());
+    test.assert_eq(trail.check_event("k", "abc", "{}", 0), trail.bad_parent());
+    // Upper case is not an id, and neither is a 64-character string that is not hex.
+    test.assert_eq(trail.check_event("k", "0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef", "{}", 0), trail.bad_parent());
+    test.assert_eq(trail.check_event("k", "g123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "{}", 0), trail.bad_parent());
+    test.assert_eq(trail.check_event("k", "", "{\"a\":\0}", 0), trail.bad_payload());
+    test.assert_eq(trail.check_event("k", "", "{}", 0 - 1), trail.bad_time());
+    test.assert_eq(trail.check_event("k", "", "{}", 1000000000000000000), trail.bad_time());
+    return 0;
+}
+
+fn test_a_record_of_the_wrong_shape_is_refused() -> [] int {
+    region a {
+        let r = alloc_slice[a](512, byte_of(0));
+        let id = alloc_slice[a](64, byte_of(0));
+        put(r, "k", "", "{}", 5, 5, 0);
+        id_of(r, id);
+        // Four pairs.
+        var q = record.begin(r, 0, 5, 0, 4);
+        q = record.put_pair(r, q, "id", id);
+        q = record.put_pair(r, q, "kind", "k");
+        q = record.put_pair(r, q, "parent", "");
+        q = record.put_pair(r, q, "payload", "{}");
+        record.seal(r, 0, q);
+        test.assert_eq(trail.check_record(r, 0, r[0..0], 0 - 1, 0 - 1), trail.why_shape());
+        // Five pairs, two of them swapped.
+        q = record.begin(r, 0, 5, 0, 5);
+        q = record.put_pair(r, q, "id", id);
+        q = record.put_pair(r, q, "parent", "");
+        q = record.put_pair(r, q, "kind", "k");
+        q = record.put_pair(r, q, "payload", "{}");
+        q = record.put_pair(r, q, "ts_ms", "5");
+        record.seal(r, 0, q);
+        test.assert_eq(trail.check_record(r, 0, r[0..0], 0 - 1, 0 - 1), trail.why_shape());
+        // A key with one byte more.
+        q = record.begin(r, 0, 5, 0, 5);
+        q = record.put_pair(r, q, "id", id);
+        q = record.put_pair(r, q, "kind", "k");
+        q = record.put_pair(r, q, "parent", "");
+        q = record.put_pair(r, q, "payload", "{}");
+        q = record.put_pair(r, q, "ts_ms ", "5");
+        record.seal(r, 0, q);
+        test.assert_eq(trail.check_record(r, 0, r[0..0], 0 - 1, 0 - 1), trail.why_shape());
+        // The shape that is right passes (the control for the three above).
+        q = record.begin(r, 0, 5, 0, 5);
+        q = record.put_pair(r, q, "id", id);
+        q = record.put_pair(r, q, "kind", "k");
+        q = record.put_pair(r, q, "parent", "");
+        q = record.put_pair(r, q, "payload", "{}");
+        q = record.put_pair(r, q, "ts_ms", "5");
+        record.seal(r, 0, q);
+        test.assert_eq(trail.check_record(r, 0, r[0..0], 0 - 1, 0 - 1), 0);
+    }
+    return 0;
+}
+
+// A record with the right shape and the given id and time text.
+fn shaped[&o, &i, &t](out: &!o [byte], id: &i [byte], kind: &i [byte], ts: &t [byte], ms: int) -> [] int {
+    var q = record.begin(out, 0, ms, 0, 5);
+    q = record.put_pair(out, q, "id", id);
+    q = record.put_pair(out, q, "kind", kind);
+    q = record.put_pair(out, q, "parent", "");
+    q = record.put_pair(out, q, "payload", "{}");
+    q = record.put_pair(out, q, "ts_ms", ts);
+    return record.seal(out, 0, q);
+}
+
+fn test_a_field_that_is_not_canonical_is_refused() -> [] int {
+    region a {
+        let r = alloc_slice[a](512, byte_of(0));
+        let id = alloc_slice[a](64, byte_of(0));
+        put(r, "k", "", "{}", 5, 5, 0);
+        id_of(r, id);
+        // The stored id in upper case: not an id, whatever it would hash to.
+        let up = "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF";
+        shaped(r, up, "k", "5", 5);
+        test.assert_eq(trail.check_record(r, 0, r[0..0], 0 - 1, 0 - 1), trail.why_field());
+        // A time with a leading zero, a sign, a letter, nothing, or 19 digits.
+        shaped(r, id, "k", "05", 5);
+        test.assert_eq(trail.check_record(r, 0, r[0..0], 0 - 1, 0 - 1), trail.why_field());
+        shaped(r, id, "k", "+5", 5);
+        test.assert_eq(trail.check_record(r, 0, r[0..0], 0 - 1, 0 - 1), trail.why_field());
+        shaped(r, id, "k", "5x", 5);
+        test.assert_eq(trail.check_record(r, 0, r[0..0], 0 - 1, 0 - 1), trail.why_field());
+        shaped(r, id, "k", "", 5);
+        test.assert_eq(trail.check_record(r, 0, r[0..0], 0 - 1, 0 - 1), trail.why_field());
+        shaped(r, id, "k", "1000000000000000000", 5);
+        test.assert_eq(trail.check_record(r, 0, r[0..0], 0 - 1, 0 - 1), trail.why_field());
+        // An empty kind.
+        shaped(r, id, "", "5", 5);
+        test.assert_eq(trail.check_record(r, 0, r[0..0], 0 - 1, 0 - 1), trail.why_field());
+        // The control: "0" is a time, and so is the largest.
+        shaped(r, id, "k", "5", 5);
+        test.assert_eq(trail.check_record(r, 0, r[0..0], 0 - 1, 0 - 1), 0);
+    }
+    return 0;
+}
+
+fn test_the_encoded_length_is_exact() -> [] int {
+    region a {
+        let r = alloc_slice[a](1024, byte_of(0));
+        let id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        test.assert_eq(put(r, "k", "", "", 0, 0, 0), trail.encoded_len(1, 0, 0, 0));
+        test.assert_eq(put(r, "meter.reading", id, "{\"wh\":105500}", 1788000000000, 1788000000000, 0), trail.encoded_len(13, 64, 13, 1788000000000));
+        test.assert_eq(trail.decimal_len(0), 1);
+        test.assert_eq(trail.decimal_len(9), 1);
+        test.assert_eq(trail.decimal_len(10), 2);
+        test.assert_eq(trail.decimal_len(999999999999999999), 18);
+    }
+    return 0;
+}
+
+fn test_an_anchor_over_the_wrong_number_of_ids_is_refused() -> [] int {
+    region a {
+        let out = alloc_slice[a](64, byte_of(0));
+        test.assert_eq(trail.anchor_digest("a\0b\0", 3, out), 0 - 1);
+        test.assert_eq(trail.anchor_digest("a\0b", 2, out), 0 - 1);
+        test.assert_eq(trail.anchor_digest("", 0, out), 0);
+    }
+    return 0;
+}
+
+fn test_an_anchor_sorts_a_prefix_first() -> [] int {
+    region a {
+        let out = alloc_slice[a](64, byte_of(0));
+        let want = "36c258ea99b5f5c563952948f01bf43245187ce9c5c3e03be58d325691b4dc32";
+        // "a" sorts before "ab" whichever way they arrive.
+        test.assert_eq(trail.anchor_digest("ab\0a\0", 2, out), 0);
+        var i = 0;
+        while i < 64 {
+            test.assert_eq(int_of(out[i]), int_of(want[i]));
+            i = i + 1;
+        }
+        test.assert_eq(trail.anchor_digest("a\0ab\0", 2, out), 0);
+        i = 0;
+        while i < 64 {
+            test.assert_eq(int_of(out[i]), int_of(want[i]));
+            i = i + 1;
+        }
+    }
+    return 0;
+}
+
+// A parent with `c` (a character just outside the hex ranges) at `at`, and otherwise a good id.
+fn parent_with[&o](out: &!o [byte], at: int, c: int) -> [] int {
+    let good = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    var i = 0;
+    while i < 64 {
+        out[i] = good[i];
+        i = i + 1;
+    }
+    out[at] = byte_of(c);
+    return 0;
+}
+
+fn test_every_character_just_outside_hex_is_refused_in_any_place() -> [] int {
+    region a {
+        let p = alloc_slice[a](64, byte_of(0));
+        // '/' is below '0', ':' above '9', '@' below 'A', '`' below 'a', 'g' above 'f'.
+        let bad = alloc_slice[a](5, byte_of(0));
+        bad[0] = byte_of(47);
+        bad[1] = byte_of(58);
+        bad[2] = byte_of(64);
+        bad[3] = byte_of(96);
+        bad[4] = byte_of(103);
+        var k = 0;
+        while k < 5 {
+            parent_with(p, 0, int_of(bad[k]));
+            test.assert_eq(trail.check_event("k", p, "", 0), trail.bad_parent());
+            parent_with(p, 63, int_of(bad[k]));
+            test.assert_eq(trail.check_event("k", p, "", 0), trail.bad_parent());
+            k = k + 1;
+        }
+        // The edges that are hex: 0, 9, a, f.
+        parent_with(p, 0, 48);
+        test.assert_eq(trail.check_event("k", p, "", 0), 0);
+        parent_with(p, 63, 57);
+        test.assert_eq(trail.check_event("k", p, "", 0), 0);
+        parent_with(p, 63, 97);
+        test.assert_eq(trail.check_event("k", p, "", 0), 0);
+        parent_with(p, 63, 102);
+        test.assert_eq(trail.check_event("k", p, "", 0), 0);
+    }
+    return 0;
+}
+
+// A record with these five keys and otherwise the values of a good event.
+fn keyed[&o, &a, &b, &c, &d, &e, &i](out: &!o [byte], k0: &a [byte], k1: &b [byte], k2: &c [byte], k3: &d [byte], k4: &e [byte], id: &i [byte]) -> [] int {
+    var q = record.begin(out, 0, 5, 0, 5);
+    q = record.put_pair(out, q, k0, id);
+    q = record.put_pair(out, q, k1, "k");
+    q = record.put_pair(out, q, k2, "");
+    q = record.put_pair(out, q, k3, "{}");
+    q = record.put_pair(out, q, k4, "5");
+    return record.seal(out, 0, q);
+}
+
+fn test_each_of_the_five_keys_must_be_the_right_one() -> [] int {
+    region a {
+        let r = alloc_slice[a](512, byte_of(0));
+        let id = alloc_slice[a](64, byte_of(0));
+        let none = alloc_slice[a](1, byte_of(0));
+        put(r, "k", "", "{}", 5, 5, 0);
+        id_of(r, id);
+        keyed(r, "id", "kind", "parent", "payload", "ts_ms", id);
+        test.assert_eq(trail.check_record(r, 0, none[0..0], 0 - 1, 0 - 1), 0);
+        keyed(r, "ix", "kind", "parent", "payload", "ts_ms", id);
+        test.assert_eq(trail.check_record(r, 0, none[0..0], 0 - 1, 0 - 1), trail.why_shape());
+        keyed(r, "id", "kinx", "parent", "payload", "ts_ms", id);
+        test.assert_eq(trail.check_record(r, 0, none[0..0], 0 - 1, 0 - 1), trail.why_shape());
+        keyed(r, "id", "kind", "parenx", "payload", "ts_ms", id);
+        test.assert_eq(trail.check_record(r, 0, none[0..0], 0 - 1, 0 - 1), trail.why_shape());
+        keyed(r, "id", "kind", "parent", "payloax", "ts_ms", id);
+        test.assert_eq(trail.check_record(r, 0, none[0..0], 0 - 1, 0 - 1), trail.why_shape());
+        keyed(r, "id", "kind", "parent", "payload", "ts_mx", id);
+        test.assert_eq(trail.check_record(r, 0, none[0..0], 0 - 1, 0 - 1), trail.why_shape());
+    }
+    return 0;
+}
+
+fn test_a_sixth_pair_is_refused() -> [] int {
+    region a {
+        let r = alloc_slice[a](512, byte_of(0));
+        let id = alloc_slice[a](64, byte_of(0));
+        put(r, "k", "", "{}", 5, 5, 0);
+        id_of(r, id);
+        var q = record.begin(r, 0, 5, 0, 6);
+        q = record.put_pair(r, q, "id", id);
+        q = record.put_pair(r, q, "kind", "k");
+        q = record.put_pair(r, q, "parent", "");
+        q = record.put_pair(r, q, "payload", "{}");
+        q = record.put_pair(r, q, "ts_ms", "5");
+        q = record.put_pair(r, q, "extra", "x");
+        record.seal(r, 0, q);
+        test.assert_eq(trail.check_record(r, 0, r[0..0], 0 - 1, 0 - 1), trail.why_shape());
+    }
+    return 0;
+}
+
+fn test_a_time_that_overflows_or_is_not_digits_is_refused_without_trapping() -> [] int {
+    region a {
+        let r = alloc_slice[a](512, byte_of(0));
+        let id = alloc_slice[a](64, byte_of(0));
+        put(r, "k", "", "{}", 5, 5, 0);
+        id_of(r, id);
+        // 19 digits above 2^63, exactly 2^63, and 20 digits: none may overflow the parse.
+        keyed(r, "id", "kind", "parent", "payload", "ts_ms", id);
+        var q = record.begin(r, 0, 5, 0, 5);
+        q = record.put_pair(r, q, "id", id);
+        q = record.put_pair(r, q, "kind", "k");
+        q = record.put_pair(r, q, "parent", "");
+        q = record.put_pair(r, q, "payload", "{}");
+        q = record.put_pair(r, q, "ts_ms", "9999999999999999999");
+        record.seal(r, 0, q);
+        test.assert_eq(trail.check_record(r, 0, r[0..0], 0 - 1, 0 - 1), trail.why_field());
+        q = record.begin(r, 0, 5, 0, 5);
+        q = record.put_pair(r, q, "id", id);
+        q = record.put_pair(r, q, "kind", "k");
+        q = record.put_pair(r, q, "parent", "");
+        q = record.put_pair(r, q, "payload", "{}");
+        q = record.put_pair(r, q, "ts_ms", "9223372036854775808");
+        record.seal(r, 0, q);
+        test.assert_eq(trail.check_record(r, 0, r[0..0], 0 - 1, 0 - 1), trail.why_field());
+        // '/' and ':' sit just outside '0' and '9'.
+        q = record.begin(r, 0, 5, 0, 5);
+        q = record.put_pair(r, q, "id", id);
+        q = record.put_pair(r, q, "kind", "k");
+        q = record.put_pair(r, q, "parent", "");
+        q = record.put_pair(r, q, "payload", "{}");
+        q = record.put_pair(r, q, "ts_ms", "5/");
+        record.seal(r, 0, q);
+        test.assert_eq(trail.check_record(r, 0, r[0..0], 0 - 1, 0 - 1), trail.why_field());
+        q = record.begin(r, 0, 5, 0, 5);
+        q = record.put_pair(r, q, "id", id);
+        q = record.put_pair(r, q, "kind", "k");
+        q = record.put_pair(r, q, "parent", "");
+        q = record.put_pair(r, q, "payload", "{}");
+        q = record.put_pair(r, q, "ts_ms", ":5");
+        record.seal(r, 0, q);
+        test.assert_eq(trail.check_record(r, 0, r[0..0], 0 - 1, 0 - 1), trail.why_field());
+        q = record.begin(r, 0, 5, 0, 5);
+        q = record.put_pair(r, q, "id", id);
+        q = record.put_pair(r, q, "kind", "k");
+        q = record.put_pair(r, q, "parent", "");
+        q = record.put_pair(r, q, "payload", "{}");
+        q = record.put_pair(r, q, "ts_ms", "5");
+        record.seal(r, 0, q);
+        test.assert_eq(trail.check_record(r, 0, r[0..0], 0 - 1, 0 - 1), 0);
+    }
+    return 0;
+}

@@ -16,8 +16,10 @@ It is **not** a Kafka replacement: one node, no replication, no consensus.
 
 **L0, the append path built.** Done: the checksum (`src/crc.cho`), the record format (`src/record.cho`), the scan and recovery of
 a segment (`src/segment.cho`), and the append path (`src/log.cho`: append, flush, read-back, group flush). Each is tested from
-bytes and by a crash sweep against an independent reader. Not yet: rolling segments, the manifest, an index, consumer groups,
-the Redis Streams front-end, trail mode. [`docs/design.md`](docs/design.md) is the plan; its measurements are of Redis, of
+bytes and by a crash sweep against an independent reader. **Trail mode, first form:** `src/trail.cho` stores [lex-trail](https://github.com/alpibrusl/lex-trail) events as a hash-chained, linear
+log (its ids reproduce lex-trail's vectors), verifies a file, and checks it against an external anchor; see [`docs/trail.md`](docs/trail.md)
+for what it proves and what it does not. Not yet: rolling segments, the manifest, an index, consumer groups, the Redis Streams
+front-end, trail queries. [`docs/design.md`](docs/design.md) is the plan; its measurements are of Redis, of
 the disk and of the checksum, not yet of this engine.
 
 ## Requirements
